@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -237,6 +238,148 @@ def warning_reactions_config() -> dict[str, Any]:
 def warning_replies_config() -> dict[str, Any]:
     cfg = config.get("warning_replies", {})
     return cfg if isinstance(cfg, dict) else {}
+
+
+def hard_moderation_overrides_config() -> dict[str, Any]:
+    cfg = config.get("hard_moderation_overrides", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def hard_moderation_overrides_enabled() -> bool:
+    return bool(hard_moderation_overrides_config().get("enabled", True))
+
+
+def racial_slur_overrides_config() -> dict[str, Any]:
+    cfg = hard_moderation_overrides_config().get("racial_slurs", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def racial_slur_overrides_enabled() -> bool:
+    cfg = racial_slur_overrides_config()
+    return hard_moderation_overrides_enabled() and bool(cfg.get("enabled", True))
+
+
+def hard_override_score(default: float = 0.95) -> float:
+    cfg = hard_moderation_overrides_config()
+
+    try:
+        return clamp01(cfg.get("score", default))
+    except Exception:
+        return default
+
+
+def hard_override_confidence(default: float = 1.0) -> float:
+    cfg = hard_moderation_overrides_config()
+
+    try:
+        return clamp01(cfg.get("confidence", default))
+    except Exception:
+        return default
+
+
+# Built-in hard override terms for common exact-word racial slur cases that
+# an LLM may occasionally under-score. Keep these literal for readability.
+BUILTIN_RACIAL_SLUR_TERMS = [
+    "nigger",
+    "nigga",
+]
+
+
+def normalize_for_hard_overrides(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = "".join(
+        char
+        for char in normalized
+        if unicodedata.category(char) not in {"Mn", "Cf"}
+    )
+    return normalized
+
+
+def normalized_hard_override_terms(terms: list[str]) -> set[str]:
+    normalized_terms: set[str] = set()
+
+    for term in terms:
+        normalized = normalize_for_hard_overrides(str(term))
+        compact = re.sub(r"[^a-z0-9]+", "", normalized)
+
+        if compact:
+            normalized_terms.add(compact)
+
+    return normalized_terms
+
+
+def configured_racial_slur_terms() -> set[str]:
+    cfg = racial_slur_overrides_config()
+    terms: list[str] = []
+
+    if bool(cfg.get("include_builtin_terms", True)):
+        terms.extend(BUILTIN_RACIAL_SLUR_TERMS)
+
+    configured_terms = cfg.get("terms", [])
+
+    if isinstance(configured_terms, list):
+        terms.extend(str(term) for term in configured_terms)
+
+    return normalized_hard_override_terms(terms)
+
+
+def message_contains_racial_slur_override(message_content: str) -> bool:
+    if not racial_slur_overrides_enabled():
+        return False
+
+    terms = configured_racial_slur_terms()
+
+    if not terms:
+        return False
+
+    normalized = normalize_for_hard_overrides(message_content)
+    tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+
+    if tokens & terms:
+        return True
+
+    # Catch messages that are only a separated/spaced version of the configured
+    # hard term, without treating long normal sentences as compact matches.
+    if len(tokens) <= 6 and compact in terms:
+        return True
+
+    return False
+
+
+def apply_hard_moderation_overrides(
+    message: discord.Message,
+    score: ModerationScore,
+) -> ModerationScore:
+    if not hard_moderation_overrides_enabled():
+        return score
+
+    if not message_contains_racial_slur_override(message.content or ""):
+        return score
+
+    cfg = racial_slur_overrides_config()
+    override_score = hard_override_score(default=0.95)
+
+    if score.score >= override_score:
+        return score
+
+    category = str(cfg.get("category", "racial_slur_hard_override"))[:80]
+    reason = str(
+        cfg.get(
+            "reason",
+            "Message contains a configured racial slur hard override term.",
+        )
+    )[:500]
+
+    return ModerationScore(
+        score=override_score,
+        category=category,
+        reason=(
+            f"{reason} Original model score was {score.score:.2f} "
+            f"with category {score.category!r}."
+        )[:500],
+        confidence=max(score.confidence, hard_override_confidence(default=1.0)),
+    )
 
 
 def threshold_matches(score_value: float, threshold: Any, default: float = 0.70) -> bool:
@@ -1455,6 +1598,8 @@ async def on_message(message: discord.Message) -> None:
         print(f"Failed to score message {message.id}: {error}")
         await bot.process_commands(message)
         return
+
+    score = apply_hard_moderation_overrides(message, score)
 
     print(
         f"message={message.id} user={message.author.id} "

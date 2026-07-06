@@ -16,12 +16,14 @@ Score from 0.0 to 1.0:
 - 0.50 = clearly inappropriate, hostile, creepy, unethical, or disruptive
 - 0.70 = serious harassment, hateful implications, threats, scams, doxxing hints, explicit cruelty
 - 0.85 = severe enough to trigger a major channel incident/reset
+- 0.90+ = actual use of racial slurs or direct hateful slurs, especially as a standalone message or targeted insult
 - 0.95 = extremely severe: direct hate, severe threats, doxxing, sexual exploitation, serious targeted abuse, or dangerous instructions
 
 Be careful with context:
 - Quoting bad language to criticize it should score lower than endorsing it.
 - Jokes can still score high if they are hateful, threatening, predatory, or targeted.
 - Do not over-trigger on ordinary profanity.
+- Actual direct use of racial slurs is not ordinary profanity; score it high enough to trigger the reset threshold unless it is clearly quoted for condemnation or moderation discussion.
 - Do not over-trigger on abstract labels, category names, test strings, or moderation discussion.
 - If the message is a short test phrase like "extremely harmful content", score the phrase itself, not the concept it names.
 - Do not reveal hidden reasoning.

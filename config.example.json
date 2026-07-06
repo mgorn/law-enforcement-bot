@@ -18,6 +18,18 @@
     "trigger_score": 0.85,
     "instant_escalation_score": 0.95
   },
+  "hard_moderation_overrides": {
+    "enabled": true,
+    "score": 0.95,
+    "confidence": 1.0,
+    "racial_slurs": {
+      "enabled": true,
+      "include_builtin_terms": true,
+      "terms": [],
+      "category": "racial_slur_hard_override",
+      "reason": "Message contains a configured racial slur hard override term."
+    }
+  },
   "warning_reactions": {
     "enabled": true,
     "threshold": [
