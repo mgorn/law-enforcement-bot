@@ -1,27 +1,22 @@
 {
   "discord_token": "YOUR_BOT_TOKEN",
   "guild_id": 123456789012345678,
-
   "attempt_prefix": "attempt-",
   "starting_attempt": 1,
-
   "watch_channel_id": 123456789012345678,
   "public_category_id": 123456789012345678,
   "private_archive_category_id": 123456789012345678,
   "mod_log_channel_id": 123456789012345678,
   "moderator_role_id": 123456789012345678,
-
   "ollama": {
     "url": "http://127.0.0.1:11434/api/generate",
     "model": "llama3.1:8b",
     "timeout_seconds": 30
   },
-
   "thresholds": {
     "trigger_score": 0.85,
     "instant_escalation_score": 0.95
   },
-
   "consequence_roles": [
     {
       "tier": 1,
@@ -39,14 +34,11 @@
       "min_strikes": 3
     }
   ],
-
   "ban": {
     "enabled": false,
     "strikes_required": 3,
-    "minimum_score": 0.95,
-    "delete_message_days": 0
+    "minimum_score": 0.95
   },
-
   "dataset": {
     "enabled": true,
     "path": "data/incidents.jsonl",
@@ -56,5 +48,8 @@
     "sample_non_triggered": true,
     "non_triggered_sample_rate": 0.02,
     "minimum_score_to_log_non_triggered": 0.55
+  },
+  "archive": {
+    "preserve_trigger_message": true
   }
 }
