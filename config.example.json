@@ -11,7 +11,8 @@
   "ollama": {
     "url": "http://127.0.0.1:11434/api/generate",
     "model": "llama3.1:8b",
-    "timeout_seconds": 30
+    "timeout_seconds": 30,
+    "prompt_path": "prompt.txt"
   },
   "thresholds": {
     "trigger_score": 0.85,

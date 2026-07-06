@@ -529,6 +529,53 @@ async def maybe_send_warning_actions(message: discord.Message, score: Moderation
     await maybe_send_warning_reply(message, score)
 
 
+def read_prompt_file(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+
+    text = path.read_text(encoding="utf-8").strip()
+
+    if not text:
+        return None
+
+    return text
+
+
+def configured_ollama_system_prompt() -> str:
+    ollama_cfg = config.get("ollama", {})
+    prompt_path = Path("prompt.txt")
+
+    if isinstance(ollama_cfg, dict):
+        configured_path = ollama_cfg.get("prompt_path")
+
+        if isinstance(configured_path, str) and configured_path.strip():
+            prompt_path = Path(configured_path.strip())
+
+    prompt = read_prompt_file(prompt_path)
+
+    if prompt is not None:
+        return prompt
+
+    default_prompt = read_prompt_file(Path("prompt.default.txt"))
+
+    if default_prompt is not None:
+        return default_prompt
+
+    if isinstance(ollama_cfg, dict):
+        # Backward compatibility for configs created by the older patch.
+        # Prefer prompt.txt for new configs so the prompt can be edited without
+        # escaping newlines in JSON.
+        legacy_system_prompt = ollama_cfg.get("system_prompt")
+
+        if isinstance(legacy_system_prompt, str) and legacy_system_prompt.strip():
+            return legacy_system_prompt.strip()
+
+    raise RuntimeError(
+        "No Ollama moderation prompt found. Create prompt.txt, restore "
+        "prompt.default.txt, or set ollama.prompt_path in config.json."
+    )
+
+
 def clean_for_prompt(text: str, max_len: int = 1800) -> str:
     text = text.replace("\x00", "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -690,36 +737,7 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
             }
         )
 
-    system_prompt = """
-You are a strict but careful Discord moderation scoring system.
-
-Return only valid JSON.
-
-Your job is to estimate how severe, nasty, harmful, or moderation-worthy a message is.
-
-Score from 0.0 to 1.0:
-- 0.00 = harmless
-- 0.20 = mildly annoying, weird, rude, or off-topic
-- 0.50 = clearly inappropriate, hostile, creepy, unethical, or disruptive
-- 0.70 = serious harassment, hateful implications, threats, scams, doxxing hints, explicit cruelty
-- 0.85 = severe enough to trigger a major channel incident/reset
-- 0.95 = extremely severe: direct hate, severe threats, doxxing, sexual exploitation, serious targeted abuse, or dangerous instructions
-
-Be careful with context:
-- Quoting bad language to criticize it should score lower than endorsing it.
-- Jokes can still score high if they are hateful, threatening, predatory, or targeted.
-- Do not over-trigger on ordinary profanity.
-- Do not reveal hidden reasoning.
-- Return a concise reason.
-
-JSON shape:
-{
-  "score": number,
-  "category": string,
-  "reason": string,
-  "confidence": number
-}
-""".strip()
+    system_prompt = configured_ollama_system_prompt()
 
     user_prompt = {
         "author_id": str(message.author.id),
