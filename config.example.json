@@ -22,12 +22,12 @@
     "enabled": true,
     "score": 0.95,
     "confidence": 1.0,
-    "racial_slurs": {
+    "banned_terms": {
       "enabled": true,
       "include_builtin_terms": true,
-      "terms": [],
-      "category": "racial_slur_hard_override",
-      "reason": "Message contains a configured racial slur hard override term."
+      "terms": [ "nigger" ],
+      "category": "banned_term_override",
+      "reason": "Message contains a configured banned term."
     }
   },
   "warning_reactions": {

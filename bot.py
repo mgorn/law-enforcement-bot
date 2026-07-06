@@ -249,13 +249,19 @@ def hard_moderation_overrides_enabled() -> bool:
     return bool(hard_moderation_overrides_config().get("enabled", True))
 
 
-def racial_slur_overrides_config() -> dict[str, Any]:
-    cfg = hard_moderation_overrides_config().get("racial_slurs", {})
+def banned_terms_config() -> dict[str, Any]:
+    overrides_cfg = hard_moderation_overrides_config()
+    cfg = overrides_cfg.get("banned_terms")
+
+    # Backward compatibility for configs created before this section was renamed.
+    if cfg is None:
+        cfg = overrides_cfg.get("racial_slurs", {})
+
     return cfg if isinstance(cfg, dict) else {}
 
 
-def racial_slur_overrides_enabled() -> bool:
-    cfg = racial_slur_overrides_config()
+def banned_terms_enabled() -> bool:
+    cfg = banned_terms_config()
     return hard_moderation_overrides_enabled() and bool(cfg.get("enabled", True))
 
 
@@ -277,11 +283,14 @@ def hard_override_confidence(default: float = 1.0) -> float:
         return default
 
 
-# Built-in hard override terms for common exact-word racial slur cases that
-# an LLM may occasionally under-score. Keep these literal for readability.
-BUILTIN_RACIAL_SLUR_TERMS = [
+# Built-in banned terms that should always trigger a reset when used directly.
+# Keep these literal for readability: this is moderation policy, not magic.
+#
+# The slang variant is intentionally not included here. It may still be scored
+# by the model and can produce warning reactions/replies, but it should not be
+# an automatic hard reset by itself.
+BUILTIN_BANNED_TERMS = [
     "nigger",
-    "nigga",
 ]
 
 
@@ -308,12 +317,12 @@ def normalized_hard_override_terms(terms: list[str]) -> set[str]:
     return normalized_terms
 
 
-def configured_racial_slur_terms() -> set[str]:
-    cfg = racial_slur_overrides_config()
+def configured_banned_terms() -> set[str]:
+    cfg = banned_terms_config()
     terms: list[str] = []
 
     if bool(cfg.get("include_builtin_terms", True)):
-        terms.extend(BUILTIN_RACIAL_SLUR_TERMS)
+        terms.extend(BUILTIN_BANNED_TERMS)
 
     configured_terms = cfg.get("terms", [])
 
@@ -323,11 +332,11 @@ def configured_racial_slur_terms() -> set[str]:
     return normalized_hard_override_terms(terms)
 
 
-def message_contains_racial_slur_override(message_content: str) -> bool:
-    if not racial_slur_overrides_enabled():
+def message_contains_banned_term(message_content: str) -> bool:
+    if not banned_terms_enabled():
         return False
 
-    terms = configured_racial_slur_terms()
+    terms = configured_banned_terms()
 
     if not terms:
         return False
@@ -354,20 +363,20 @@ def apply_hard_moderation_overrides(
     if not hard_moderation_overrides_enabled():
         return score
 
-    if not message_contains_racial_slur_override(message.content or ""):
+    if not message_contains_banned_term(message.content or ""):
         return score
 
-    cfg = racial_slur_overrides_config()
+    cfg = banned_terms_config()
     override_score = hard_override_score(default=0.95)
 
     if score.score >= override_score:
         return score
 
-    category = str(cfg.get("category", "racial_slur_hard_override"))[:80]
+    category = str(cfg.get("category", "banned_term_override"))[:80]
     reason = str(
         cfg.get(
             "reason",
-            "Message contains a configured racial slur hard override term.",
+            "Message contains a configured banned term.",
         )
     )[:500]
 
