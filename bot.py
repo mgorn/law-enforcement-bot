@@ -1,0 +1,1412 @@
+import asyncio
+import json
+import random
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+
+CONFIG_PATH = Path("config.json")
+STATE_PATH = Path("state.json")
+
+MESSAGE_LINK_RE = re.compile(
+    r"https://(?:canary\.|ptb\.)?discord\.com/channels/"
+    r"(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
+)
+
+VALID_LABELS = {
+    "bad",
+    "borderline",
+    "false_positive",
+    "contextual_quote",
+    "joke_but_bad",
+    "severe_banworthy",
+    "spam",
+    "scam",
+    "harassment",
+    "hate",
+    "threat",
+    "doxxing",
+    "sexual",
+    "other",
+}
+
+
+@dataclass
+class ModerationScore:
+    score: float
+    category: str
+    reason: str
+    confidence: float
+
+
+@dataclass
+class PermissionCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def load_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not path.exists():
+        return fallback or {}
+
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_json(path: Path, data: dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, sort_keys=True)
+
+    tmp_path.replace(path)
+
+
+config = load_json(CONFIG_PATH)
+
+if not config:
+    raise RuntimeError(
+        "Missing config.json. Copy config.example.json to config.json and edit the IDs."
+    )
+
+
+def default_state() -> dict[str, Any]:
+    return {
+        "current_attempt": int(config.get("starting_attempt", 1)),
+        "watch_channel_id": int(config["watch_channel_id"]),
+        "user_strikes": {},
+    }
+
+
+state = load_json(STATE_PATH, default_state())
+save_json(STATE_PATH, state)
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+incident_lock = asyncio.Lock()
+
+
+def snowflake(value: Any) -> int:
+    return int(value)
+
+
+def format_forbidden(action: str, error: discord.Forbidden) -> str:
+    return (
+        f"{action} failed with 403 Missing Permissions. "
+        "Check the bot role's server permissions, channel/category overwrites, "
+        "and role hierarchy."
+    )
+
+
+def role_is_manageable_by_bot(guild: discord.Guild, role: discord.Role) -> tuple[bool, str]:
+    bot_member = guild.me
+
+    if bot_member is None:
+        return False, "Could not resolve the bot member in this guild."
+
+    if role.managed:
+        return False, f"Role @{role.name} is managed by an integration and cannot be assigned manually."
+
+    if bot_member.guild_permissions.administrator:
+        # Administrator still cannot bypass role hierarchy for role assignment.
+        pass
+
+    if role >= bot_member.top_role:
+        return (
+            False,
+            (
+                f"Role @{role.name} is not below the bot's highest role "
+                f"@{bot_member.top_role.name}. Move the bot role above it in Server Settings > Roles."
+            ),
+        )
+
+    return True, f"Role @{role.name} is below bot top role @{bot_member.top_role.name}."
+
+
+def channel_permission_checks(channel: discord.TextChannel | discord.CategoryChannel, label: str) -> list[PermissionCheck]:
+    guild = channel.guild
+    bot_member = guild.me
+
+    if bot_member is None:
+        return [PermissionCheck(label, False, "Could not resolve bot member.")]
+
+    perms = channel.permissions_for(bot_member)
+
+    checks = [
+        PermissionCheck(f"{label}: view_channel", perms.view_channel, "Needed to see the channel/category."),
+        PermissionCheck(f"{label}: send_messages", perms.send_messages, "Needed for notices/log messages where applicable."),
+        PermissionCheck(f"{label}: manage_channels", perms.manage_channels, "Needed to create, rename, move, and lock attempt channels."),
+        PermissionCheck(f"{label}: manage_roles", perms.manage_roles, "Needed to edit channel permission overwrites."),
+        PermissionCheck(f"{label}: read_message_history", perms.read_message_history, "Needed to preserve/review channel history."),
+    ]
+
+    return checks
+
+
+def summarize_permission_checks(checks: list[PermissionCheck]) -> str:
+    lines = []
+
+    for check in checks:
+        icon = "OK" if check.ok else "MISSING"
+        lines.append(f"{icon}: {check.name} - {check.detail}")
+
+    return "\n".join(lines)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def attempt_name(number: int) -> str:
+    return f"{config.get('attempt_prefix', 'attempt-')}{number}"
+
+
+def archive_name(number: int) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"archive-{attempt_name(number)}-{timestamp}"
+
+
+def dataset_config() -> dict[str, Any]:
+    return config.get("dataset", {})
+
+
+def should_store_message_content() -> bool:
+    return bool(dataset_config().get("store_message_content", True))
+
+
+def should_store_author_id() -> bool:
+    return bool(dataset_config().get("store_author_id", True))
+
+
+def should_store_channel_id() -> bool:
+    return bool(dataset_config().get("store_channel_id", True))
+
+
+def clean_for_prompt(text: str, max_len: int = 1800) -> str:
+    text = text.replace("\x00", "")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+
+    return text
+
+
+def clamp01(value: Any) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        return 0.0
+
+    return max(0.0, min(1.0, number))
+
+
+def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
+    raw = payload.get("response", "{}")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return ModerationScore(
+            score=0.0,
+            category="parse_error",
+            reason="The moderation model did not return valid JSON.",
+            confidence=0.0,
+        )
+
+    return ModerationScore(
+        score=clamp01(data.get("score", 0.0)),
+        category=str(data.get("category", "unknown"))[:80],
+        reason=str(data.get("reason", "No reason provided."))[:500],
+        confidence=clamp01(data.get("confidence", 0.0)),
+    )
+
+
+def parse_message_reference(value: str) -> tuple[int | None, int]:
+    value = value.strip()
+    match = MESSAGE_LINK_RE.fullmatch(value)
+
+    if match:
+        return int(match.group("channel_id")), int(match.group("message_id"))
+
+    if value.isdigit():
+        return None, int(value)
+
+    raise ValueError("Expected a Discord message link or raw message ID.")
+
+
+async def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+
+    with path.open("a", encoding="utf-8") as file:
+        file.write(line + "\n")
+
+
+async def log_training_record(record: dict[str, Any]) -> None:
+    ds_cfg = dataset_config()
+
+    if not bool(ds_cfg.get("enabled", True)):
+        return
+
+    path = Path(ds_cfg.get("path", "data/incidents.jsonl"))
+    await append_jsonl(path, record)
+
+
+def make_training_record(
+    *,
+    event_type: str,
+    message: discord.Message,
+    score: ModerationScore,
+    triggered: bool,
+    manual: bool = False,
+    silent: bool = False,
+    moderator: discord.Member | discord.User | None = None,
+    strikes_after: int | None = None,
+    consequence_tier: int | None = None,
+    banned: bool = False,
+    old_attempt: int | None = None,
+    new_attempt: int | None = None,
+    old_channel_id: int | None = None,
+    new_channel_id: int | None = None,
+) -> dict[str, Any]:
+    attachments = []
+
+    for attachment in message.attachments:
+        attachments.append(
+            {
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "size": attachment.size,
+                "url": attachment.url,
+            }
+        )
+
+    record = {
+        "schema_version": 1,
+        "event_type": event_type,
+        "created_at": utc_now_iso(),
+        "guild_id": str(message.guild.id) if message.guild is not None else None,
+        "message_id": str(message.id),
+        "message_jump_url": message.jump_url,
+        "message_created_at": message.created_at.isoformat(),
+        "triggered": triggered,
+        "manual": manual,
+        "silent": silent,
+        "ollama_score": score.score,
+        "ollama_category": score.category,
+        "ollama_reason": score.reason,
+        "ollama_confidence": score.confidence,
+        "strikes_after": strikes_after,
+        "consequence_tier": consequence_tier,
+        "banned": banned,
+        "old_attempt": old_attempt,
+        "new_attempt": new_attempt,
+        "old_channel_id": str(old_channel_id) if old_channel_id is not None else None,
+        "new_channel_id": str(new_channel_id) if new_channel_id is not None else None,
+        "attachments": attachments,
+        "moderator_label": None,
+        "moderator_notes": None,
+        "was_appealed": False,
+        "appeal_result": None,
+        "usable_for_training": True,
+    }
+
+    record["message_content"] = message.content or "" if should_store_message_content() else None
+    record["author_id"] = str(message.author.id) if should_store_author_id() else None
+    record["channel_id"] = str(message.channel.id) if should_store_channel_id() else None
+    record["moderator_id"] = str(moderator.id) if moderator is not None else None
+
+    return record
+
+
+async def score_message_with_ollama(message: discord.Message) -> ModerationScore:
+    ollama_cfg = config["ollama"]
+    message_text = clean_for_prompt(message.content or "")
+
+    if not message_text and not message.attachments:
+        return ModerationScore(
+            score=0.0,
+            category="empty",
+            reason="No text content or attachments to evaluate.",
+            confidence=1.0,
+        )
+
+    attachment_summary = []
+
+    for attachment in message.attachments:
+        attachment_summary.append(
+            {
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "url": attachment.url,
+            }
+        )
+
+    system_prompt = """
+You are a strict but careful Discord moderation scoring system.
+
+Return only valid JSON.
+
+Your job is to estimate how severe, nasty, harmful, or moderation-worthy a message is.
+
+Score from 0.0 to 1.0:
+- 0.00 = harmless
+- 0.20 = mildly annoying, weird, rude, or off-topic
+- 0.50 = clearly inappropriate, hostile, creepy, unethical, or disruptive
+- 0.70 = serious harassment, hateful implications, threats, scams, doxxing hints, explicit cruelty
+- 0.85 = severe enough to trigger a major channel incident/reset
+- 0.95 = extremely severe: direct hate, severe threats, doxxing, sexual exploitation, serious targeted abuse, or dangerous instructions
+
+Be careful with context:
+- Quoting bad language to criticize it should score lower than endorsing it.
+- Jokes can still score high if they are hateful, threatening, predatory, or targeted.
+- Do not over-trigger on ordinary profanity.
+- Do not reveal hidden reasoning.
+- Return a concise reason.
+
+JSON shape:
+{
+  "score": number,
+  "category": string,
+  "reason": string,
+  "confidence": number
+}
+""".strip()
+
+    user_prompt = {
+        "author_id": str(message.author.id),
+        "author_name": str(message.author),
+        "channel_id": str(message.channel.id),
+        "message": message_text,
+        "attachments": attachment_summary,
+    }
+
+    request_payload = {
+        "model": ollama_cfg["model"],
+        "system": system_prompt,
+        "prompt": json.dumps(user_prompt, ensure_ascii=False),
+        "format": "json",
+        "stream": False,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=float(ollama_cfg.get("timeout_seconds", 30)))
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(ollama_cfg["url"], json=request_payload) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+    return parse_ollama_response(payload)
+
+
+async def fetch_message_for_nuke(
+    interaction: discord.Interaction,
+    message_ref: str,
+) -> discord.Message:
+    channel_id, message_id = parse_message_reference(message_ref)
+
+    if interaction.guild is None:
+        raise RuntimeError("This command can only be used in a server.")
+
+    if channel_id is None:
+        if not isinstance(interaction.channel, discord.TextChannel):
+            raise RuntimeError("Raw message IDs only work inside a text channel.")
+
+        channel = interaction.channel
+    else:
+        channel = interaction.guild.get_channel(channel_id)
+
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError("The referenced message is not in a text channel.")
+
+    return await channel.fetch_message(message_id)
+
+
+async def assign_consequence_role(member: discord.Member, strikes: int) -> int | None:
+    consequence_roles = sorted(
+        config.get("consequence_roles", []),
+        key=lambda item: int(item["min_strikes"]),
+    )
+
+    selected = None
+
+    for role_cfg in consequence_roles:
+        if strikes >= int(role_cfg["min_strikes"]):
+            selected = role_cfg
+
+    if selected is None:
+        return None
+
+    configured_role_ids = {int(role_cfg["role_id"]) for role_cfg in consequence_roles}
+
+    for role_id in configured_role_ids:
+        role = member.guild.get_role(role_id)
+
+        if role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Updating moderation consequence tier")
+            except discord.Forbidden as error:
+                raise RuntimeError(format_forbidden(f"Removing role @{role.name}", error)) from error
+
+    selected_role = member.guild.get_role(int(selected["role_id"]))
+
+    if selected_role is None:
+        return None
+
+    manageable, detail = role_is_manageable_by_bot(member.guild, selected_role)
+
+    if not manageable:
+        raise RuntimeError(detail)
+
+    try:
+        await member.add_roles(
+            selected_role,
+            reason=f"Moderation consequence tier {selected['tier']} after {strikes} strike(s)",
+        )
+    except discord.Forbidden as error:
+        raise RuntimeError(format_forbidden(f"Assigning role @{selected_role.name}", error)) from error
+
+    return int(selected["tier"])
+
+
+async def maybe_ban_member(
+    member: discord.Member,
+    strikes: int,
+    score: ModerationScore,
+) -> bool:
+    ban_cfg = config.get("ban", {})
+
+    if not bool(ban_cfg.get("enabled", False)):
+        return False
+
+    strikes_required = int(ban_cfg.get("strikes_required", 3))
+    minimum_score = float(ban_cfg.get("minimum_score", 0.95))
+
+    if strikes < strikes_required:
+        return False
+
+    if score.score < minimum_score:
+        return False
+
+    # Keep message history intact. The trigger message should remain inside the
+    # archived channel for moderator review, appeals, and future dataset labeling.
+    try:
+        await member.ban(
+            reason=(
+                f"Automatic ban after {strikes} strike(s). "
+                f"Latest score={score.score:.2f}, category={score.category}"
+            ),
+            delete_message_days=0,
+        )
+    except discord.Forbidden as error:
+        raise RuntimeError(format_forbidden(f"Banning member {member.id}", error)) from error
+
+    return True
+
+
+def increment_user_strikes(user_id: int) -> int:
+    user_key = str(user_id)
+    strikes = int(state.setdefault("user_strikes", {}).get(user_key, 0)) + 1
+    state["user_strikes"][user_key] = strikes
+    save_json(STATE_PATH, state)
+    return strikes
+
+
+async def lock_channel(channel: discord.TextChannel, reason: str) -> None:
+    everyone = channel.guild.default_role
+
+    await channel.set_permissions(
+        everyone,
+        send_messages=False,
+        add_reactions=False,
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False,
+        reason=reason,
+    )
+
+
+async def privatize_archive_channel(channel: discord.TextChannel, reason: str) -> None:
+    guild = channel.guild
+    everyone = guild.default_role
+
+    await channel.set_permissions(
+        everyone,
+        view_channel=False,
+        send_messages=False,
+        read_message_history=False,
+        reason=reason,
+    )
+
+    moderator_role_id = config.get("moderator_role_id")
+
+    if moderator_role_id:
+        mod_role = guild.get_role(int(moderator_role_id))
+
+        if mod_role is not None:
+            await channel.set_permissions(
+                mod_role,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+                reason=reason,
+            )
+
+
+async def move_to_private_archive(
+    channel: discord.TextChannel,
+    attempt_number: int,
+    reason: str,
+) -> None:
+    archive_category_id = snowflake(config["private_archive_category_id"])
+    archive_category = channel.guild.get_channel(archive_category_id)
+
+    if archive_category is None:
+        archive_category = await bot.fetch_channel(archive_category_id)
+
+    if not isinstance(archive_category, discord.CategoryChannel):
+        raise RuntimeError("private_archive_category_id is not a category channel.")
+
+    await channel.edit(
+        name=archive_name(attempt_number),
+        category=archive_category,
+        sync_permissions=False,
+        reason=reason,
+    )
+
+    await lock_channel(channel, reason)
+    await privatize_archive_channel(channel, reason)
+
+
+async def create_next_attempt_channel(
+    old_channel: discord.TextChannel,
+    next_attempt_number: int,
+) -> discord.TextChannel:
+    public_category_id = config.get("public_category_id")
+    category = old_channel.category
+
+    if public_category_id:
+        possible_category = old_channel.guild.get_channel(snowflake(public_category_id))
+
+        if isinstance(possible_category, discord.CategoryChannel):
+            category = possible_category
+
+    overwrites = dict(old_channel.overwrites)
+
+    new_channel = await old_channel.guild.create_text_channel(
+        name=attempt_name(next_attempt_number),
+        category=category,
+        topic=old_channel.topic,
+        slowmode_delay=old_channel.slowmode_delay,
+        nsfw=old_channel.nsfw,
+        overwrites=overwrites,
+        reason=f"Creating {attempt_name(next_attempt_number)} after moderation incident",
+    )
+
+    try:
+        await new_channel.edit(position=old_channel.position)
+    except discord.HTTPException:
+        pass
+
+    return new_channel
+
+
+async def send_incident_review(
+    old_channel: discord.TextChannel,
+    new_channel: discord.TextChannel,
+    message: discord.Message,
+    score: ModerationScore,
+    strikes: int,
+    consequence_tier: int | None,
+    banned: bool,
+) -> None:
+    log_channel_id = snowflake(config["mod_log_channel_id"])
+    log_channel = old_channel.guild.get_channel(log_channel_id)
+
+    if log_channel is None:
+        log_channel = await bot.fetch_channel(log_channel_id)
+
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+
+    attachment_lines = []
+
+    for attachment in message.attachments:
+        attachment_lines.append(f"- {attachment.filename}: {attachment.url}")
+
+    attachment_text = "\n".join(attachment_lines) if attachment_lines else "None"
+
+    embed = discord.Embed(title="Attempt reset incident", color=discord.Color.red())
+    embed.add_field(name="Score", value=f"{score.score:.2f}", inline=True)
+    embed.add_field(name="Confidence", value=f"{score.confidence:.2f}", inline=True)
+    embed.add_field(name="Category", value=score.category, inline=True)
+    embed.add_field(name="User", value=f"{message.author} / `{message.author.id}`", inline=False)
+    embed.add_field(name="Strikes", value=str(strikes), inline=True)
+    embed.add_field(name="Tier", value=str(consequence_tier or "none"), inline=True)
+    embed.add_field(name="Auto-banned", value=str(banned), inline=True)
+    embed.add_field(name="Old channel", value=old_channel.mention, inline=True)
+    embed.add_field(name="New channel", value=new_channel.mention, inline=True)
+    embed.add_field(name="Reason", value=score.reason[:1024], inline=False)
+
+    content = clean_for_prompt(message.content or "[no text content]", max_len=1800)
+
+    await log_channel.send(
+        content=(
+            "**Triggering message for moderator review / appeal record:**\n"
+            f">>> {content}\n\n"
+            f"**Attachments:**\n{attachment_text}"
+        ),
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def send_archive_notice(
+    archived_channel: discord.TextChannel,
+    new_channel: discord.TextChannel,
+    score: ModerationScore,
+) -> None:
+    await archived_channel.send(
+        content=(
+            "Locked: this attempt has been archived for moderator review.\n\n"
+            f"New channel: {new_channel.mention}\n"
+            f"Moderation score: `{score.score:.2f}`\n"
+            f"Category: `{score.category}`"
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def send_new_channel_notice(new_channel: discord.TextChannel, attempt_number: int) -> None:
+    await new_channel.send(
+        content=(
+            f"Welcome to **{attempt_name(attempt_number)}**.\n\n"
+            "The previous attempt was archived for moderator review. Please keep this one normal."
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def maybe_log_non_triggered_message(
+    message: discord.Message,
+    score: ModerationScore,
+) -> None:
+    ds_cfg = dataset_config()
+
+    if not bool(ds_cfg.get("enabled", True)):
+        return
+
+    if not bool(ds_cfg.get("sample_non_triggered", False)):
+        return
+
+    minimum_score = float(ds_cfg.get("minimum_score_to_log_non_triggered", 0.55))
+    sample_rate = float(ds_cfg.get("non_triggered_sample_rate", 0.02))
+
+    should_log = score.score >= minimum_score or random.random() < sample_rate
+
+    if not should_log:
+        return
+
+    record = make_training_record(
+        event_type="non_triggered_sample",
+        message=message,
+        score=score,
+        triggered=False,
+        manual=False,
+        silent=False,
+        old_attempt=int(state["current_attempt"]),
+        new_attempt=int(state["current_attempt"]),
+        old_channel_id=message.channel.id,
+        new_channel_id=message.channel.id,
+    )
+
+    record["usable_for_training"] = False
+    await log_training_record(record)
+
+
+async def reset_attempt_from_message(
+    message: discord.Message,
+    score: ModerationScore,
+    *,
+    manual: bool,
+    silent: bool,
+    moderator: discord.Member | discord.User | None = None,
+) -> discord.TextChannel:
+    async with incident_lock:
+        if message.channel.id != int(state["watch_channel_id"]):
+            raise RuntimeError("That message is not in the currently watched attempt channel.")
+
+        if not isinstance(message.channel, discord.TextChannel):
+            raise RuntimeError("The message channel is not a text channel.")
+
+        if not isinstance(message.author, discord.Member):
+            raise RuntimeError("The message author is not a guild member.")
+
+        guild = message.guild
+
+        if guild is None:
+            raise RuntimeError("Message is not from a guild.")
+
+        old_channel = message.channel
+        member = message.author
+        old_attempt = int(state["current_attempt"])
+        next_attempt = old_attempt if silent else old_attempt + 1
+        mode_label = "manual silent nuke" if silent else ("manual nuke" if manual else "automatic reset")
+        reason = (
+            f"{mode_label}: score={score.score:.2f}, "
+            f"category={score.category}, user={member.id}"
+        )
+
+        warnings: list[str] = []
+        strikes = int(state.setdefault("user_strikes", {}).get(str(member.id), 0))
+        consequence_tier = None
+        banned = False
+
+        # The channel reset is the primary action. Do it before role/ban consequences so
+        # a role hierarchy problem does not prevent the trigger message from being archived.
+        try:
+            new_channel = await create_next_attempt_channel(old_channel, next_attempt)
+        except discord.Forbidden as error:
+            raise RuntimeError(format_forbidden("Creating the replacement attempt channel", error)) from error
+
+        state["current_attempt"] = next_attempt
+        state["watch_channel_id"] = new_channel.id
+        save_json(STATE_PATH, state)
+
+        try:
+            await move_to_private_archive(old_channel, old_attempt, reason)
+        except discord.Forbidden as error:
+            raise RuntimeError(format_forbidden("Moving/privatizing the old attempt channel", error)) from error
+
+        if not silent:
+            strikes = increment_user_strikes(member.id)
+
+            try:
+                consequence_tier = await assign_consequence_role(member, strikes)
+            except Exception as error:
+                warning = f"Consequence role step skipped: {error}"
+                warnings.append(warning)
+                print(warning)
+
+            try:
+                banned = await maybe_ban_member(member, strikes, score)
+            except Exception as error:
+                warning = f"Ban step skipped: {error}"
+                warnings.append(warning)
+                print(warning)
+
+        try:
+            await send_incident_review(
+                old_channel=old_channel,
+                new_channel=new_channel,
+                message=message,
+                score=score,
+                strikes=strikes,
+                consequence_tier=consequence_tier,
+                banned=banned,
+            )
+        except discord.Forbidden as error:
+            warning = format_forbidden("Sending the moderator incident review", error)
+            warnings.append(warning)
+            print(warning)
+
+        event_type = "manual_silent_nuke" if silent else ("manual_nuke" if manual else "auto_trigger")
+        training_record = make_training_record(
+            event_type=event_type,
+            message=message,
+            score=score,
+            triggered=True,
+            manual=manual,
+            silent=silent,
+            moderator=moderator,
+            strikes_after=strikes,
+            consequence_tier=consequence_tier,
+            banned=banned,
+            old_attempt=old_attempt,
+            new_attempt=next_attempt,
+            old_channel_id=old_channel.id,
+            new_channel_id=new_channel.id,
+        )
+        training_record["warnings"] = warnings
+        await log_training_record(training_record)
+
+        try:
+            await send_archive_notice(old_channel, new_channel, score)
+        except discord.Forbidden as error:
+            warning = format_forbidden("Sending notice in the archived channel", error)
+            warnings.append(warning)
+            print(warning)
+
+        try:
+            if silent:
+                await new_channel.send(
+                    content=(
+                        f"Replacement channel for **{attempt_name(next_attempt)}** created.\n\n"
+                        "The previous channel was archived for moderator review."
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await send_new_channel_notice(new_channel, next_attempt)
+        except discord.Forbidden as error:
+            warning = format_forbidden("Sending notice in the new attempt channel", error)
+            warnings.append(warning)
+            print(warning)
+
+        if moderator is not None:
+            mod_log_channel_id = config.get("mod_log_channel_id")
+
+            if mod_log_channel_id:
+                log_channel = guild.get_channel(int(mod_log_channel_id))
+
+                if log_channel is None:
+                    log_channel = await bot.fetch_channel(int(mod_log_channel_id))
+
+                if isinstance(log_channel, discord.TextChannel):
+                    try:
+                        await log_channel.send(
+                            content=(
+                                f"Manual nuke executed by {moderator.mention}.\n"
+                                f"Silent: `{silent}`\n"
+                                f"New active channel: {new_channel.mention}"
+                            ),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except discord.Forbidden as error:
+                        warning = format_forbidden("Sending manual nuke log message", error)
+                        warnings.append(warning)
+                        print(warning)
+
+        if warnings:
+            print("Reset completed with warnings:")
+            for warning in warnings:
+                print(f"- {warning}")
+
+        return new_channel
+
+async def build_preflight_report(guild: discord.Guild) -> str:
+    checks: list[PermissionCheck] = []
+    bot_member = guild.me
+
+    if bot_member is None:
+        return "Could not resolve the bot member in this guild."
+
+    guild_perms = bot_member.guild_permissions
+    guild_level = [
+        PermissionCheck("guild: manage_channels", guild_perms.manage_channels, "Needed to create/move/rename attempt channels."),
+        PermissionCheck("guild: manage_roles", guild_perms.manage_roles, "Needed for consequence roles and channel permission overwrites."),
+        PermissionCheck("guild: ban_members", guild_perms.ban_members or not bool(config.get("ban", {}).get("enabled", False)), "Needed only if auto-ban is enabled."),
+        PermissionCheck("guild: view_audit_log", guild_perms.view_audit_log or True, "Optional."),
+    ]
+    checks.extend(guild_level)
+
+    for channel_id, label in [
+        (config.get("watch_channel_id"), "configured watch channel"),
+        (state.get("watch_channel_id"), "current state watch channel"),
+        (config.get("public_category_id"), "public category"),
+        (config.get("private_archive_category_id"), "private archive category"),
+        (config.get("mod_log_channel_id"), "mod log channel"),
+    ]:
+        if not channel_id:
+            continue
+
+        channel = guild.get_channel(int(channel_id))
+
+        if channel is None:
+            checks.append(PermissionCheck(label, False, f"Could not find channel/category ID {channel_id}."))
+            continue
+
+        if isinstance(channel, (discord.TextChannel, discord.CategoryChannel)):
+            checks.extend(channel_permission_checks(channel, label))
+        else:
+            checks.append(PermissionCheck(label, False, f"ID {channel_id} is not a text channel or category."))
+
+    consequence_roles = config.get("consequence_roles", [])
+
+    for role_cfg in consequence_roles:
+        role_id = int(role_cfg["role_id"])
+        role = guild.get_role(role_id)
+        tier = role_cfg.get("tier", "?")
+
+        if role is None:
+            checks.append(PermissionCheck(f"consequence role tier {tier}", False, f"Could not find role ID {role_id}."))
+            continue
+
+        manageable, detail = role_is_manageable_by_bot(guild, role)
+        checks.append(PermissionCheck(f"consequence role tier {tier}: @{role.name}", manageable, detail))
+
+    missing = [check for check in checks if not check.ok]
+    header = [
+        f"Bot member: {bot_member} / `{bot_member.id}`",
+        f"Bot top role: @{bot_member.top_role.name}",
+        f"Missing checks: {len(missing)}",
+        "",
+    ]
+
+    body = summarize_permission_checks(checks)
+    report = "\n".join(header) + body
+
+    if len(report) > 1900:
+        report = report[:1850] + "\n... truncated; fix the first missing checks and run again."
+
+    return report
+
+
+@bot.tree.command(name="attempt-preflight", description="Check bot permissions and role hierarchy for attempt resets.")
+@app_commands.default_permissions(manage_guild=True)
+async def attempt_preflight(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    report = await build_preflight_report(interaction.guild)
+    await interaction.followup.send(f"```text\n{report}\n```", ephemeral=True)
+
+
+@bot.event
+async def on_ready() -> None:
+    print(f"Logged in as {bot.user}")
+    print(f"Watching channel ID: {state['watch_channel_id']}")
+    print(f"Current attempt: {state['current_attempt']}")
+
+    try:
+        guild = discord.Object(id=int(config["guild_id"]))
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} slash command(s).")
+    except Exception as error:
+        print(f"Failed to sync slash commands: {error}")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    if message.guild.id != snowflake(config["guild_id"]):
+        return
+
+    if message.channel.id != int(state["watch_channel_id"]):
+        return
+
+    # on_message fires after Discord has already accepted and stored the message.
+    # The bot does not block, delete, suppress, or pre-moderate the trigger message.
+    # If it triggers, the original channel is moved into the private archive with
+    # the message still inside it.
+    try:
+        score = await score_message_with_ollama(message)
+    except Exception as error:
+        print(f"Failed to score message {message.id}: {error}")
+        await bot.process_commands(message)
+        return
+
+    print(
+        f"message={message.id} user={message.author.id} "
+        f"score={score.score:.2f} category={score.category!r}"
+    )
+
+    trigger_threshold = float(config["thresholds"]["trigger_score"])
+
+    if score.score < trigger_threshold:
+        await maybe_log_non_triggered_message(message, score)
+        await bot.process_commands(message)
+        return
+
+    try:
+        await reset_attempt_from_message(message, score, manual=False, silent=False)
+    except Exception as error:
+        print(f"Failed to handle trigger for message {message.id}: {error}")
+
+    await bot.process_commands(message)
+
+
+@bot.tree.command(
+    name="nuke",
+    description="Archive the current attempt channel and create a replacement.",
+)
+@app_commands.describe(
+    message="Message ID or Discord message link that caused the nuke.",
+    silent="If true, reset the channel without incrementing attempts or strikes.",
+)
+@app_commands.default_permissions(manage_channels=True)
+async def nuke(
+    interaction: discord.Interaction,
+    message: str,
+    silent: bool = False,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("Could not resolve your server member object.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need Manage Channels permission to use this command.", ephemeral=True)
+        return
+
+    try:
+        target_message = await fetch_message_for_nuke(interaction, message)
+    except Exception as error:
+        await interaction.followup.send(f"Could not fetch that message: `{error}`", ephemeral=True)
+        return
+
+    if target_message.guild is None or target_message.guild.id != int(config["guild_id"]):
+        await interaction.followup.send("That message is not from the configured server.", ephemeral=True)
+        return
+
+    if target_message.channel.id != int(state["watch_channel_id"]):
+        await interaction.followup.send(
+            "That message is not in the currently active attempt channel.",
+            ephemeral=True,
+        )
+        return
+
+    if target_message.author.bot:
+        await interaction.followup.send("I will not nuke attempts because of bot messages.", ephemeral=True)
+        return
+
+    if silent:
+        score = ModerationScore(
+            score=0.0,
+            category="manual_silent_nuke",
+            reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
+            confidence=1.0,
+        )
+    else:
+        score = ModerationScore(
+            score=1.0,
+            category="manual_nuke",
+            reason="A moderator manually marked this message as severe enough to reset the attempt.",
+            confidence=1.0,
+        )
+
+    try:
+        new_channel = await reset_attempt_from_message(
+            target_message,
+            score,
+            manual=True,
+            silent=silent,
+            moderator=interaction.user,
+        )
+    except Exception as error:
+        await interaction.followup.send(f"Failed to nuke the attempt: `{error}`", ephemeral=True)
+        return
+
+    if silent:
+        await interaction.followup.send(
+            f"Silent nuke complete. Replacement channel: {new_channel.mention}",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"Nuke complete. New attempt channel: {new_channel.mention}",
+            ephemeral=True,
+        )
+
+
+@app_commands.context_menu(name="Nuke Attempt")
+@app_commands.default_permissions(manage_channels=True)
+async def nuke_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need Manage Channels permission to use this.", ephemeral=True)
+        return
+
+    if message.channel.id != int(state["watch_channel_id"]):
+        await interaction.followup.send(
+            "That message is not in the currently active attempt channel.",
+            ephemeral=True,
+        )
+        return
+
+    score = ModerationScore(
+        score=1.0,
+        category="manual_context_menu_nuke",
+        reason="A moderator manually marked this message as severe enough to reset the attempt.",
+        confidence=1.0,
+    )
+
+    try:
+        new_channel = await reset_attempt_from_message(
+            message,
+            score,
+            manual=True,
+            silent=False,
+            moderator=interaction.user,
+        )
+    except Exception as error:
+        await interaction.followup.send(f"Failed to nuke the attempt: `{error}`", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"Nuke complete. New attempt channel: {new_channel.mention}",
+        ephemeral=True,
+    )
+
+
+@app_commands.context_menu(name="Silent Nuke Attempt")
+@app_commands.default_permissions(manage_channels=True)
+async def silent_nuke_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need Manage Channels permission to use this.", ephemeral=True)
+        return
+
+    if message.channel.id != int(state["watch_channel_id"]):
+        await interaction.followup.send(
+            "That message is not in the currently active attempt channel.",
+            ephemeral=True,
+        )
+        return
+
+    score = ModerationScore(
+        score=0.0,
+        category="manual_silent_context_menu_nuke",
+        reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
+        confidence=1.0,
+    )
+
+    try:
+        new_channel = await reset_attempt_from_message(
+            message,
+            score,
+            manual=True,
+            silent=True,
+            moderator=interaction.user,
+        )
+    except Exception as error:
+        await interaction.followup.send(f"Failed to silent nuke the attempt: `{error}`", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"Silent nuke complete. Replacement channel: {new_channel.mention}",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(nuke_context_menu)
+bot.tree.add_command(silent_nuke_context_menu)
+
+
+@bot.tree.command(name="attempt-state", description="Show the current attempt bot state.")
+@app_commands.default_permissions(manage_guild=True)
+async def attempt_state(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        content=(
+            f"Current attempt: `{state['current_attempt']}`\n"
+            f"Watching channel: <#{state['watch_channel_id']}>"
+        ),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="set-attempt-channel", description="Set the channel currently watched by the bot.")
+@app_commands.describe(channel="The text channel the bot should watch.")
+@app_commands.default_permissions(manage_guild=True)
+async def set_attempt_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+) -> None:
+    state["watch_channel_id"] = channel.id
+    save_json(STATE_PATH, state)
+
+    await interaction.response.send_message(
+        content=f"Now watching {channel.mention}.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="reset-strikes", description="Reset a member's strikes and configured consequence roles.")
+@app_commands.describe(member="The member whose strikes should be reset.")
+@app_commands.default_permissions(manage_roles=True)
+async def reset_strikes(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    state.setdefault("user_strikes", {})[str(member.id)] = 0
+    save_json(STATE_PATH, state)
+
+    configured_role_ids = {int(role_cfg["role_id"]) for role_cfg in config.get("consequence_roles", [])}
+
+    for role_id in configured_role_ids:
+        role = interaction.guild.get_role(role_id)
+
+        if role is not None and role in member.roles:
+            await member.remove_roles(role, reason="Moderator reset strikes")
+
+    await interaction.response.send_message(
+        content=f"Reset strikes and configured consequence roles for {member.mention}.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+
+
+@bot.tree.command(name="label-incident", description="Add a moderator training label to a message or incident.")
+@app_commands.describe(
+    message="Message ID or Discord message link.",
+    label="Training label.",
+    notes="Optional moderator notes.",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def label_incident(
+    interaction: discord.Interaction,
+    message: str,
+    label: str,
+    notes: str | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.followup.send("You need Manage Messages permission to label incidents.", ephemeral=True)
+        return
+
+    normalized_label = label.strip().lower()
+
+    if normalized_label not in VALID_LABELS:
+        allowed = ", ".join(sorted(VALID_LABELS))
+        await interaction.followup.send(
+            f"Unknown label `{label}`. Valid labels: {allowed}",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        _channel_id, message_id = parse_message_reference(message)
+    except Exception as error:
+        await interaction.followup.send(f"Invalid message reference: `{error}`", ephemeral=True)
+        return
+
+    record = {
+        "schema_version": 1,
+        "event_type": "moderator_label",
+        "created_at": utc_now_iso(),
+        "guild_id": str(interaction.guild.id),
+        "message_id": str(message_id),
+        "moderator_id": str(interaction.user.id),
+        "moderator_label": normalized_label,
+        "moderator_notes": notes,
+        "usable_for_training": True,
+    }
+
+    await log_training_record(record)
+
+    await interaction.followup.send(
+        f"Recorded label `{normalized_label}` for message `{message_id}`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="appeal-result", description="Record the result of an appeal for a moderation incident.")
+@app_commands.describe(
+    message="Message ID or Discord message link.",
+    result="Appeal result, like approved, denied, partial, mistaken_identity.",
+    notes="Optional appeal notes.",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def appeal_result(
+    interaction: discord.Interaction,
+    message: str,
+    result: str,
+    notes: str | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.followup.send(
+            "You need Manage Messages permission to record appeal results.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        _channel_id, message_id = parse_message_reference(message)
+    except Exception as error:
+        await interaction.followup.send(f"Invalid message reference: `{error}`", ephemeral=True)
+        return
+
+    normalized_result = result.strip().lower()
+
+    record = {
+        "schema_version": 1,
+        "event_type": "appeal_result",
+        "created_at": utc_now_iso(),
+        "guild_id": str(interaction.guild.id),
+        "message_id": str(message_id),
+        "moderator_id": str(interaction.user.id),
+        "appeal_result": normalized_result,
+        "appeal_notes": notes,
+        "usable_for_training": normalized_result in {
+            "approved",
+            "denied",
+            "partial",
+            "false_positive",
+        },
+    }
+
+    await log_training_record(record)
+
+    await interaction.followup.send(
+        f"Recorded appeal result `{normalized_result}` for message `{message_id}`.",
+        ephemeral=True,
+    )
+
+
+bot.run(config["discord_token"])
