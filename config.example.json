@@ -17,6 +17,32 @@
     "trigger_score": 0.85,
     "instant_escalation_score": 0.95
   },
+  "warning_reactions": {
+    "enabled": true,
+    "threshold": [
+      0.65,
+      0.85
+    ],
+    "reactions": [
+      "⚠️"
+    ]
+  },
+  "warning_replies": {
+    "enabled": false,
+    "threshold": [
+      0.75,
+      0.85
+    ],
+    "replies": [
+      "{user_mention}, easy there. Category: **{category}**. Score: `{score}`. Reason: {reason}",
+      "Warning for {user_mention}: this scored `{score}` for **{category}**."
+    ],
+    "allowed_mentions": {
+      "users": true,
+      "roles": false,
+      "everyone": false
+    }
+  },
   "consequence_roles": {
     "enabled": true,
     "tiers": [

@@ -149,6 +149,7 @@ def channel_permission_checks(channel: discord.TextChannel | discord.CategoryCha
     checks = [
         PermissionCheck(f"{label}: view_channel", perms.view_channel, "Needed to see the channel/category."),
         PermissionCheck(f"{label}: send_messages", perms.send_messages, "Needed for notices/log messages where applicable."),
+        PermissionCheck(f"{label}: add_reactions", perms.add_reactions, "Needed when warning_reactions is enabled."),
         PermissionCheck(f"{label}: manage_channels", perms.manage_channels, "Needed to create, rename, move, and lock attempt channels."),
         PermissionCheck(f"{label}: manage_roles", perms.manage_roles, "Needed to edit channel permission overwrites."),
         PermissionCheck(f"{label}: read_message_history", perms.read_message_history, "Needed to preserve/review channel history."),
@@ -226,6 +227,40 @@ def consequence_role_tiers() -> list[dict[str, Any]]:
 def new_channel_first_message_config() -> dict[str, Any]:
     cfg = config.get("new_channel_first_message", {})
     return cfg if isinstance(cfg, dict) else {}
+
+
+def warning_reactions_config() -> dict[str, Any]:
+    cfg = config.get("warning_reactions", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def warning_replies_config() -> dict[str, Any]:
+    cfg = config.get("warning_replies", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def threshold_matches(score_value: float, threshold: Any, default: float = 0.70) -> bool:
+    if isinstance(threshold, (list, tuple)) and len(threshold) >= 2:
+        try:
+            first = float(threshold[0])
+            second = float(threshold[1])
+        except Exception:
+            return False
+
+        low = min(first, second)
+        high = max(first, second)
+        return low <= score_value <= high
+
+    try:
+        low = float(default if threshold is None else threshold)
+    except Exception:
+        low = default
+
+    return score_value >= low
+
+
+def warning_threshold_matches(score: ModerationScore, cfg: dict[str, Any]) -> bool:
+    return threshold_matches(score.score, cfg.get("threshold"), default=0.70)
 
 
 def strikes_command_config() -> dict[str, Any]:
@@ -329,6 +364,163 @@ def render_new_channel_message_template(
         rendered = rendered[:1947] + "..."
 
     return rendered
+
+
+def render_warning_reply_template(
+    template: str,
+    *,
+    message: discord.Message,
+    score: ModerationScore,
+) -> str:
+    attempt_number = int(state.get("current_attempt", config.get("starting_attempt", 1)))
+    user = message.author
+    channel = message.channel
+
+    values = SafeFormatDict(
+        user_mention=getattr(user, "mention", ""),
+        user_name=getattr(user, "display_name", None) or getattr(user, "name", str(user)),
+        user_tag=str(user),
+        user_id=str(user.id),
+        attempt=str(attempt_number),
+        attempt_name=attempt_name(attempt_number),
+        previous_attempt=str(attempt_number),
+        previous_attempt_name=attempt_name(attempt_number),
+        score=f"{score.score:.2f}",
+        category=score.category,
+        reason=score.reason,
+        confidence=f"{score.confidence:.2f}",
+        channel_mention=getattr(channel, "mention", ""),
+        channel_name=getattr(channel, "name", str(channel)),
+        message_id=str(message.id),
+        message_jump_url=message.jump_url,
+        manual="false",
+        silent="false",
+    )
+
+    try:
+        rendered = template.format_map(values)
+    except Exception as error:
+        rendered = f"{template}\n\n[template formatting error: {error}]"
+
+    if len(rendered) > 1950:
+        rendered = rendered[:1947] + "..."
+
+    return rendered
+
+
+def configured_reply_templates(cfg: dict[str, Any]) -> list[str]:
+    replies = cfg.get("replies")
+
+    if isinstance(replies, list):
+        return [str(reply) for reply in replies if isinstance(reply, str) and reply]
+
+    legacy_reply = cfg.get("reply")
+
+    if isinstance(legacy_reply, str) and legacy_reply:
+        return [legacy_reply]
+
+    return []
+
+
+def configured_warning_reactions(cfg: dict[str, Any]) -> list[Any]:
+    reactions = cfg.get("reactions", [])
+
+    if not isinstance(reactions, list):
+        return []
+
+    return reactions
+
+
+def resolve_configured_reaction_emoji(guild: discord.Guild | None, configured: Any) -> Any:
+    if isinstance(configured, int):
+        if guild is None:
+            raise ValueError(f"Cannot resolve custom emoji ID {configured} without a guild.")
+
+        emoji = guild.get_emoji(configured)
+
+        if emoji is None:
+            raise ValueError(f"Custom emoji ID {configured} was not found in this guild.")
+
+        return emoji
+
+    text = str(configured).strip()
+
+    if not text:
+        raise ValueError("Configured reaction emoji is empty.")
+
+    if text.isdigit():
+        if guild is None:
+            raise ValueError(f"Cannot resolve custom emoji ID {text} without a guild.")
+
+        emoji = guild.get_emoji(int(text))
+
+        if emoji is None:
+            raise ValueError(f"Custom emoji ID {text} was not found in this guild.")
+
+        return emoji
+
+    if text.startswith("<") and text.endswith(">"):
+        return discord.PartialEmoji.from_str(text)
+
+    custom_match = re.fullmatch(r"(?P<animated>a:)?(?P<name>[A-Za-z0-9_]+):(?P<id>\d+)", text)
+
+    if custom_match:
+        animated = bool(custom_match.group("animated"))
+        name = custom_match.group("name")
+        emoji_id = int(custom_match.group("id"))
+        return discord.PartialEmoji(name=name, id=emoji_id, animated=animated)
+
+    # Unicode emoji and ordinary reaction strings can be passed through directly.
+    return text
+
+
+async def maybe_send_warning_reactions(message: discord.Message, score: ModerationScore) -> None:
+    cfg = warning_reactions_config()
+
+    if not bool(cfg.get("enabled", False)):
+        return
+
+    if not warning_threshold_matches(score, cfg):
+        return
+
+    for configured in configured_warning_reactions(cfg):
+        try:
+            emoji = resolve_configured_reaction_emoji(message.guild, configured)
+            await message.add_reaction(emoji)
+        except Exception as error:
+            print(f"Warning reaction skipped for message {message.id}: {error}")
+
+
+async def maybe_send_warning_reply(message: discord.Message, score: ModerationScore) -> None:
+    cfg = warning_replies_config()
+
+    if not bool(cfg.get("enabled", False)):
+        return
+
+    if not warning_threshold_matches(score, cfg):
+        return
+
+    templates = configured_reply_templates(cfg)
+
+    if not templates:
+        return
+
+    template = random.choice(templates)
+    content = render_warning_reply_template(template, message=message, score=score)
+
+    try:
+        await message.reply(
+            content=content,
+            mention_author=False,
+            allowed_mentions=allowed_mentions_from_message_config(cfg),
+        )
+    except Exception as error:
+        print(f"Warning reply skipped for message {message.id}: {error}")
+
+
+async def maybe_send_warning_actions(message: discord.Message, score: ModerationScore) -> None:
+    await maybe_send_warning_reactions(message, score)
+    await maybe_send_warning_reply(message, score)
 
 
 def clean_for_prompt(text: str, max_len: int = 1800) -> str:
@@ -1242,6 +1434,7 @@ async def on_message(message: discord.Message) -> None:
     trigger_threshold = float(config["thresholds"]["trigger_score"])
 
     if score.score < trigger_threshold:
+        await maybe_send_warning_actions(message, score)
         await maybe_log_non_triggered_message(message, score)
         await bot.process_commands(message)
         return
