@@ -483,12 +483,18 @@ async def maybe_send_warning_reactions(message: discord.Message, score: Moderati
     if not warning_threshold_matches(score, cfg):
         return
 
-    for configured in configured_warning_reactions(cfg):
-        try:
-            emoji = resolve_configured_reaction_emoji(message.guild, configured)
-            await message.add_reaction(emoji)
-        except Exception as error:
-            print(f"Warning reaction skipped for message {message.id}: {error}")
+    reactions = configured_warning_reactions(cfg)
+
+    if not reactions:
+        return
+
+    configured = random.choice(reactions)
+
+    try:
+        emoji = resolve_configured_reaction_emoji(message.guild, configured)
+        await message.add_reaction(emoji)
+    except Exception as error:
+        print(f"Warning reaction skipped for message {message.id}: {error}")
 
 
 async def maybe_send_warning_reply(message: discord.Message, score: ModerationScore) -> None:
