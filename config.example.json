@@ -102,6 +102,12 @@
     "show_user_ids": false,
     "show_total": true
   },
+  "reset_command": {
+    "enabled": true,
+    "ephemeral": true,
+    "attempt_number": 1,
+    "clear_leaderboard": true
+  },
   "ban": {
     "enabled": false,
     "strikes_required": 3,

@@ -415,6 +415,27 @@ def warning_threshold_matches(score: ModerationScore, cfg: dict[str, Any]) -> bo
     return threshold_matches(score.score, cfg.get("threshold"), default=0.70)
 
 
+
+
+def reset_command_config() -> dict[str, Any]:
+    cfg = config.get("reset_command", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def reset_command_enabled() -> bool:
+    return bool(reset_command_config().get("enabled", True))
+
+
+def reset_command_attempt_number() -> int:
+    cfg = reset_command_config()
+
+    try:
+        attempt = int(cfg.get("attempt_number", 1))
+    except Exception:
+        attempt = 1
+
+    return max(1, attempt)
+
 def strikes_command_config() -> dict[str, Any]:
     cfg = config.get("strikes_command", {})
     return cfg if isinstance(cfg, dict) else {}
@@ -1950,6 +1971,93 @@ async def strikes_leaderboard(
 
     await interaction.response.send_message(
         content="\n".join(lines),
+        ephemeral=response_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="reset",
+    description="Reset the active attempt channel back to attempt-1 and clear the strikes leaderboard.",
+)
+@app_commands.default_permissions(administrator=True)
+async def reset_attempts(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = reset_command_config()
+    response_ephemeral = bool(cfg.get("ephemeral", True))
+
+    if not reset_command_enabled():
+        await interaction.followup.send(
+            "The reset command is disabled in the bot config.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send(
+            "You need Administrator permission to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    attempt_number = reset_command_attempt_number()
+    active_channel_id = int(state.get("watch_channel_id", config["watch_channel_id"]))
+    active_channel = interaction.guild.get_channel(active_channel_id)
+
+    if active_channel is None:
+        active_channel = await bot.fetch_channel(active_channel_id)
+
+    if not isinstance(active_channel, discord.TextChannel):
+        await interaction.followup.send(
+            f"The current watched channel ID `{active_channel_id}` is not a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    old_name = active_channel.name
+    old_attempt = state.get("current_attempt", "?")
+
+    try:
+        await active_channel.edit(
+            name=attempt_name(attempt_number),
+            reason=f"Attempt count reset by administrator {interaction.user.id}",
+        )
+    except discord.Forbidden as error:
+        await interaction.followup.send(
+            format_forbidden("Renaming the active attempt channel", error),
+            ephemeral=True,
+        )
+        return
+
+    if bool(cfg.get("clear_leaderboard", True)):
+        state["user_strikes"] = {}
+
+    state["current_attempt"] = attempt_number
+    state["watch_channel_id"] = active_channel.id
+    save_json(STATE_PATH, state)
+
+    lines = [
+        "Attempt state reset.",
+        f"Channel: {active_channel.mention}",
+        f"Renamed: `#{old_name}` -> `#{active_channel.name}`",
+        f"Attempt: `{old_attempt}` -> `{attempt_number}`",
+    ]
+
+    if bool(cfg.get("clear_leaderboard", True)):
+        lines.append("Leaderboard: cleared")
+    else:
+        lines.append("Leaderboard: kept, because `reset_command.clear_leaderboard` is false")
+
+    await interaction.followup.send(
+        "\n".join(lines),
         ephemeral=response_ephemeral,
         allowed_mentions=discord.AllowedMentions.none(),
     )
