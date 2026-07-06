@@ -18,7 +18,7 @@
     "instant_escalation_score": 0.95
   },
   "consequence_roles": {
-    "enabled": false,
+    "enabled": true,
     "tiers": [
       {
         "tier": 1,
@@ -41,15 +41,27 @@
     "enabled": true,
     "send_on_silent": true,
     "templates": [
-      "Everyone thank {user_mention} for ruining it for everyone.\n\nReason: **{category}**",
-      "{user_mention} has advanced us to **{attempt_name}**.\n\nScore: `{score}`\nCategory: `{category}`\nReason: {reason}",
-      "Welcome to **{attempt_name}**. Previous channel archived because of {user_mention}.\n\nDetected as: **{category}**"
+      "Everyone thank {user_mention} for ruining it for everyone. Reason: {reason}",
+      "{user_mention} got us to **{attempt_name}**. Category: **{category}**. Score: `{score}`",
+      "Welcome to **{attempt_name}**. The previous attempt was archived for: **{category}**"
     ],
     "allowed_mentions": {
       "users": true,
       "roles": false,
       "everyone": false
     }
+  },
+  "strikes_command": {
+    "enabled": true,
+    "moderator_only": false,
+    "default_limit": 10,
+    "max_limit": 25,
+    "ephemeral": false,
+    "title": "Reset Trigger Leaderboard",
+    "empty_message": "No reset-trigger strikes have been recorded yet.",
+    "use_mentions": true,
+    "show_user_ids": false,
+    "show_total": true
   },
   "ban": {
     "enabled": false,

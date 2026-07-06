@@ -228,6 +228,49 @@ def new_channel_first_message_config() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def strikes_command_config() -> dict[str, Any]:
+    cfg = config.get("strikes_command", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def strikes_command_enabled() -> bool:
+    return bool(strikes_command_config().get("enabled", True))
+
+
+def strikes_command_default_limit() -> int:
+    cfg = strikes_command_config()
+
+    try:
+        default_limit = int(cfg.get("default_limit", 10))
+    except Exception:
+        default_limit = 10
+
+    return max(1, default_limit)
+
+
+def strikes_command_max_limit() -> int:
+    cfg = strikes_command_config()
+
+    try:
+        max_limit = int(cfg.get("max_limit", 25))
+    except Exception:
+        max_limit = 25
+
+    return max(1, max_limit)
+
+
+def clamp_strikes_limit(limit: int | None) -> int:
+    default_limit = strikes_command_default_limit()
+    max_limit = strikes_command_max_limit()
+
+    if limit is None:
+        requested = default_limit
+    else:
+        requested = limit
+
+    return max(1, min(int(requested), max_limit))
+
+
 def allowed_mentions_from_message_config(cfg: dict[str, Any]) -> discord.AllowedMentions:
     mentions_cfg = cfg.get("allowed_mentions", {})
 
@@ -1425,6 +1468,112 @@ async def set_attempt_channel(
     await interaction.response.send_message(
         content=f"Now watching {channel.mention}.",
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="strikes", description="Show the reset-trigger leaderboard.")
+@app_commands.describe(
+    limit="Maximum number of users to show.",
+    ephemeral="Whether only you should see the leaderboard. Defaults to config.",
+)
+async def strikes_leaderboard(
+    interaction: discord.Interaction,
+    limit: int | None = None,
+    ephemeral: bool | None = None,
+) -> None:
+    cfg = strikes_command_config()
+    response_ephemeral = bool(cfg.get("ephemeral", False)) if ephemeral is None else ephemeral
+
+    if not strikes_command_enabled():
+        await interaction.response.send_message(
+            "The strikes leaderboard is disabled in the bot config.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if bool(cfg.get("moderator_only", False)):
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need Manage Server permission to view the strikes leaderboard.",
+                ephemeral=True,
+            )
+            return
+
+    user_strikes = state.get("user_strikes", {})
+
+    if not isinstance(user_strikes, dict):
+        user_strikes = {}
+
+    entries: list[tuple[int, int]] = []
+
+    for user_id_text, strike_count in user_strikes.items():
+        try:
+            user_id = int(user_id_text)
+            strikes = int(strike_count)
+        except Exception:
+            continue
+
+        if strikes <= 0:
+            continue
+
+        entries.append((user_id, strikes))
+
+    entries.sort(key=lambda item: (-item[1], item[0]))
+
+    display_limit = clamp_strikes_limit(limit)
+    shown_entries = entries[:display_limit]
+
+    if not shown_entries:
+        await interaction.response.send_message(
+            str(cfg.get("empty_message", "No reset-trigger strikes have been recorded yet.")),
+            ephemeral=response_ephemeral,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    title = str(cfg.get("title", "Reset Trigger Leaderboard"))
+    show_user_ids = bool(cfg.get("show_user_ids", False))
+    use_mentions = bool(cfg.get("use_mentions", True))
+    show_total = bool(cfg.get("show_total", True))
+
+    lines = [f"**{title}**"]
+
+    for index, (user_id, strikes) in enumerate(shown_entries, start=1):
+        member = interaction.guild.get_member(user_id)
+
+        if member is not None and not use_mentions:
+            user_display = discord.utils.escape_markdown(member.display_name)
+        elif member is not None:
+            user_display = member.mention
+        elif use_mentions:
+            user_display = f"<@{user_id}>"
+        else:
+            user_display = "Unknown user"
+
+        if show_user_ids:
+            user_display += f" (`{user_id}`)"
+
+        plural = "strike" if strikes == 1 else "strikes"
+        lines.append(f"{index}. {user_display} — **{strikes}** {plural}")
+
+    if show_total:
+        total_strikes = sum(strikes for _, strikes in entries)
+        tracked_users = len(entries)
+        lines.append("")
+        lines.append(f"Total tracked resets: **{total_strikes}** across **{tracked_users}** user(s).")
+        lines.append(f"Current attempt: **{state.get('current_attempt', '?')}**")
+
+    await interaction.response.send_message(
+        content="\n".join(lines),
+        ephemeral=response_ephemeral,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
