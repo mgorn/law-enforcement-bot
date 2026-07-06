@@ -17,23 +17,40 @@
     "trigger_score": 0.85,
     "instant_escalation_score": 0.95
   },
-  "consequence_roles": [
-    {
-      "tier": 1,
-      "role_id": 111111111111111111,
-      "min_strikes": 1
-    },
-    {
-      "tier": 2,
-      "role_id": 222222222222222222,
-      "min_strikes": 2
-    },
-    {
-      "tier": 3,
-      "role_id": 333333333333333333,
-      "min_strikes": 3
+  "consequence_roles": {
+    "enabled": false,
+    "tiers": [
+      {
+        "tier": 1,
+        "role_id": 111111111111111111,
+        "min_strikes": 1
+      },
+      {
+        "tier": 2,
+        "role_id": 222222222222222222,
+        "min_strikes": 2
+      },
+      {
+        "tier": 3,
+        "role_id": 333333333333333333,
+        "min_strikes": 3
+      }
+    ]
+  },
+  "new_channel_first_message": {
+    "enabled": true,
+    "send_on_silent": true,
+    "templates": [
+      "Everyone thank {user_mention} for ruining it for everyone.\n\nReason: **{category}**",
+      "{user_mention} has advanced us to **{attempt_name}**.\n\nScore: `{score}`\nCategory: `{category}`\nReason: {reason}",
+      "Welcome to **{attempt_name}**. Previous channel archived because of {user_mention}.\n\nDetected as: **{category}**"
+    ],
+    "allowed_mentions": {
+      "users": true,
+      "roles": false,
+      "everyone": false
     }
-  ],
+  },
   "ban": {
     "enabled": false,
     "strikes_required": 3,

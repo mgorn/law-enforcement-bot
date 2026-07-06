@@ -196,6 +196,98 @@ def should_store_channel_id() -> bool:
     return bool(dataset_config().get("store_channel_id", True))
 
 
+def consequence_roles_enabled() -> bool:
+    roles_cfg = config.get("consequence_roles", [])
+
+    if isinstance(roles_cfg, dict):
+        return bool(roles_cfg.get("enabled", True))
+
+    # Backward compatibility: the old config shape was a bare list.
+    return isinstance(roles_cfg, list) and len(roles_cfg) > 0
+
+
+def consequence_role_tiers() -> list[dict[str, Any]]:
+    roles_cfg = config.get("consequence_roles", [])
+
+    if isinstance(roles_cfg, dict):
+        tiers = roles_cfg.get("tiers", [])
+    elif isinstance(roles_cfg, list):
+        tiers = roles_cfg
+    else:
+        tiers = []
+
+    return [
+        tier
+        for tier in tiers
+        if isinstance(tier, dict) and "role_id" in tier and "min_strikes" in tier
+    ]
+
+
+def new_channel_first_message_config() -> dict[str, Any]:
+    cfg = config.get("new_channel_first_message", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def allowed_mentions_from_message_config(cfg: dict[str, Any]) -> discord.AllowedMentions:
+    mentions_cfg = cfg.get("allowed_mentions", {})
+
+    if not isinstance(mentions_cfg, dict):
+        mentions_cfg = {}
+
+    return discord.AllowedMentions(
+        users=bool(mentions_cfg.get("users", False)),
+        roles=bool(mentions_cfg.get("roles", False)),
+        everyone=bool(mentions_cfg.get("everyone", False)),
+        replied_user=False,
+    )
+
+
+class SafeFormatDict(dict[str, str]):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def render_new_channel_message_template(
+    template: str,
+    *,
+    new_channel: discord.TextChannel,
+    attempt_number: int,
+    previous_attempt_number: int,
+    user: discord.Member | discord.User,
+    score: ModerationScore,
+    manual: bool,
+    silent: bool,
+) -> str:
+    values = SafeFormatDict(
+        user_mention=getattr(user, "mention", ""),
+        user_name=getattr(user, "display_name", None) or getattr(user, "name", str(user)),
+        user_tag=str(user),
+        user_id=str(user.id),
+        attempt=str(attempt_number),
+        attempt_name=attempt_name(attempt_number),
+        previous_attempt=str(previous_attempt_number),
+        previous_attempt_name=attempt_name(previous_attempt_number),
+        score=f"{score.score:.2f}",
+        category=score.category,
+        reason=score.reason,
+        confidence=f"{score.confidence:.2f}",
+        channel_mention=new_channel.mention,
+        channel_name=new_channel.name,
+        manual=str(manual).lower(),
+        silent=str(silent).lower(),
+    )
+
+    try:
+        rendered = template.format_map(values)
+    except Exception as error:
+        rendered = f"{template}\n\n[template formatting error: {error}]"
+
+    if len(rendered) > 1950:
+        rendered = rendered[:1947] + "..."
+
+    return rendered
+
+
 def clean_for_prompt(text: str, max_len: int = 1800) -> str:
     text = text.replace("\x00", "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -441,8 +533,11 @@ async def fetch_message_for_nuke(
 
 
 async def assign_consequence_role(member: discord.Member, strikes: int) -> int | None:
+    if not consequence_roles_enabled():
+        return None
+
     consequence_roles = sorted(
-        config.get("consequence_roles", []),
+        consequence_role_tiers(),
         key=lambda item: int(item["min_strikes"]),
     )
 
@@ -532,28 +627,39 @@ def increment_user_strikes(user_id: int) -> int:
 
 async def lock_channel(channel: discord.TextChannel, reason: str) -> None:
     everyone = channel.guild.default_role
+    overwrite = channel.overwrites_for(everyone)
+
+    # Preserve any existing archive privacy bits, especially view_channel=False.
+    # Passing keyword permissions directly to set_permissions replaces the whole
+    # overwrite and can accidentally remove the View Channel deny.
+    overwrite.send_messages = False
+    overwrite.add_reactions = False
+    overwrite.create_public_threads = False
+    overwrite.create_private_threads = False
+    overwrite.send_messages_in_threads = False
 
     await channel.set_permissions(
         everyone,
+        overwrite=overwrite,
+        reason=reason,
+    )
+
+
+def private_archive_overwrites(
+    guild: discord.Guild,
+) -> dict[discord.Role | discord.Member, discord.PermissionOverwrite]:
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
+
+    # Make the archived channel invisible to normal users. This is intentionally
+    # an explicit channel overwrite instead of relying on category permissions.
+    overwrites[guild.default_role] = discord.PermissionOverwrite(
+        view_channel=False,
+        read_message_history=False,
         send_messages=False,
         add_reactions=False,
         create_public_threads=False,
         create_private_threads=False,
         send_messages_in_threads=False,
-        reason=reason,
-    )
-
-
-async def privatize_archive_channel(channel: discord.TextChannel, reason: str) -> None:
-    guild = channel.guild
-    everyone = guild.default_role
-
-    await channel.set_permissions(
-        everyone,
-        view_channel=False,
-        send_messages=False,
-        read_message_history=False,
-        reason=reason,
     )
 
     moderator_role_id = config.get("moderator_role_id")
@@ -562,14 +668,37 @@ async def privatize_archive_channel(channel: discord.TextChannel, reason: str) -
         mod_role = guild.get_role(int(moderator_role_id))
 
         if mod_role is not None:
-            await channel.set_permissions(
-                mod_role,
+            overwrites[mod_role] = discord.PermissionOverwrite(
                 view_channel=True,
-                send_messages=True,
                 read_message_history=True,
+                send_messages=True,
+                add_reactions=True,
                 manage_messages=True,
-                reason=reason,
             )
+
+    # Keep the bot able to post archive notices and future moderator tooling in
+    # the channel, even after @everyone is denied View Channel.
+    bot_member = guild.me
+
+    if bot_member is not None:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            add_reactions=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+
+    return overwrites
+
+
+async def privatize_archive_channel(channel: discord.TextChannel, reason: str) -> None:
+    await channel.edit(
+        overwrites=private_archive_overwrites(channel.guild),
+        sync_permissions=False,
+        reason=reason,
+    )
 
 
 async def move_to_private_archive(
@@ -696,13 +825,51 @@ async def send_archive_notice(
     )
 
 
-async def send_new_channel_notice(new_channel: discord.TextChannel, attempt_number: int) -> None:
-    await new_channel.send(
-        content=(
-            f"Welcome to **{attempt_name(attempt_number)}**.\n\n"
+async def send_new_channel_notice(
+    new_channel: discord.TextChannel,
+    attempt_number: int,
+    *,
+    previous_attempt_number: int,
+    user: discord.Member | discord.User,
+    score: ModerationScore,
+    manual: bool,
+    silent: bool,
+) -> None:
+    msg_cfg = new_channel_first_message_config()
+
+    if not bool(msg_cfg.get("enabled", True)):
+        return
+
+    if silent and not bool(msg_cfg.get("send_on_silent", True)):
+        return
+
+    templates = msg_cfg.get("templates")
+
+    if not isinstance(templates, list) or not templates:
+        legacy_template = msg_cfg.get("template")
+        templates = [legacy_template] if isinstance(legacy_template, str) and legacy_template else []
+
+    if not templates:
+        templates = [
+            "Welcome to **{attempt_name}**.\n\n"
             "The previous attempt was archived for moderator review. Please keep this one normal."
-        ),
-        allowed_mentions=discord.AllowedMentions.none(),
+        ]
+
+    template = str(random.choice(templates))
+    content = render_new_channel_message_template(
+        template,
+        new_channel=new_channel,
+        attempt_number=attempt_number,
+        previous_attempt_number=previous_attempt_number,
+        user=user,
+        score=score,
+        manual=manual,
+        silent=silent,
+    )
+
+    await new_channel.send(
+        content=content,
+        allowed_mentions=allowed_mentions_from_message_config(msg_cfg),
     )
 
 
@@ -857,16 +1024,15 @@ async def reset_attempt_from_message(
             print(warning)
 
         try:
-            if silent:
-                await new_channel.send(
-                    content=(
-                        f"Replacement channel for **{attempt_name(next_attempt)}** created.\n\n"
-                        "The previous channel was archived for moderator review."
-                    ),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await send_new_channel_notice(new_channel, next_attempt)
+            await send_new_channel_notice(
+                new_channel,
+                next_attempt,
+                previous_attempt_number=old_attempt,
+                user=member,
+                score=score,
+                manual=manual,
+                silent=silent,
+            )
         except discord.Forbidden as error:
             warning = format_forbidden("Sending notice in the new attempt channel", error)
             warnings.append(warning)
@@ -940,19 +1106,20 @@ async def build_preflight_report(guild: discord.Guild) -> str:
         else:
             checks.append(PermissionCheck(label, False, f"ID {channel_id} is not a text channel or category."))
 
-    consequence_roles = config.get("consequence_roles", [])
+    if consequence_roles_enabled():
+        for role_cfg in consequence_role_tiers():
+            role_id = int(role_cfg["role_id"])
+            role = guild.get_role(role_id)
+            tier = role_cfg.get("tier", "?")
 
-    for role_cfg in consequence_roles:
-        role_id = int(role_cfg["role_id"])
-        role = guild.get_role(role_id)
-        tier = role_cfg.get("tier", "?")
+            if role is None:
+                checks.append(PermissionCheck(f"consequence role tier {tier}", False, f"Could not find role ID {role_id}."))
+                continue
 
-        if role is None:
-            checks.append(PermissionCheck(f"consequence role tier {tier}", False, f"Could not find role ID {role_id}."))
-            continue
-
-        manageable, detail = role_is_manageable_by_bot(guild, role)
-        checks.append(PermissionCheck(f"consequence role tier {tier}: @{role.name}", manageable, detail))
+            manageable, detail = role_is_manageable_by_bot(guild, role)
+            checks.append(PermissionCheck(f"consequence role tier {tier}: @{role.name}", manageable, detail))
+    else:
+        checks.append(PermissionCheck("consequence roles", True, "Disabled in config."))
 
     missing = [check for check in checks if not check.ok]
     header = [
@@ -1276,7 +1443,7 @@ async def reset_strikes(
     state.setdefault("user_strikes", {})[str(member.id)] = 0
     save_json(STATE_PATH, state)
 
-    configured_role_ids = {int(role_cfg["role_id"]) for role_cfg in config.get("consequence_roles", [])}
+    configured_role_ids = {int(role_cfg["role_id"]) for role_cfg in consequence_role_tiers()}
 
     for role_id in configured_role_ids:
         role = interaction.guild.get_role(role_id)
