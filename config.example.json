@@ -15,6 +15,22 @@
     "prompt_path": "prompt.txt",
     "reason_prompt_path": "reason_prompt.txt"
   },
+  "presence": {
+    "enabled": true,
+    "status": "online",
+    "stream_ollama_scoring": true,
+    "estimated_total_tokens": 128,
+    "update_every_generated_tokens": 4,
+    "minimum_update_interval_seconds": 2.0,
+    "idle": {
+      "activity_type": "watching",
+      "template": "#{channel_name}"
+    },
+    "analyzing": {
+      "activity_type": "playing",
+      "template": "Analyzing {generated_tokens}/{total_tokens} tokens"
+    }
+  },
   "thresholds": {
     "trigger_score": 0.91,
     "trigger_score_field": "score",

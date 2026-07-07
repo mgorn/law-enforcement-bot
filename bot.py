@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -159,6 +160,9 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 incident_lock = asyncio.Lock()
 score_records_lock = asyncio.Lock()
+presence_lock = asyncio.Lock()
+active_analysis_count = 0
+last_presence_update_at = 0.0
 
 
 def snowflake(value: Any) -> int:
@@ -995,6 +999,251 @@ class SafeFormatDict(dict[str, str]):
         return "{" + key + "}"
 
 
+def presence_config() -> dict[str, Any]:
+    cfg = config.get("presence", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def presence_enabled() -> bool:
+    return bool(presence_config().get("enabled", True))
+
+
+def presence_status() -> discord.Status:
+    status_name = str(presence_config().get("status", "online")).strip().lower()
+
+    if status_name == "idle":
+        return discord.Status.idle
+
+    if status_name in {"dnd", "do_not_disturb"}:
+        return discord.Status.dnd
+
+    if status_name == "invisible":
+        return discord.Status.invisible
+
+    return discord.Status.online
+
+
+def presence_activity_type(value: Any, default: str) -> discord.ActivityType | str:
+    name = str(value or default).strip().lower()
+
+    if name == "custom":
+        return "custom"
+
+    if name == "watching":
+        return discord.ActivityType.watching
+
+    if name == "listening":
+        return discord.ActivityType.listening
+
+    if name == "streaming":
+        return discord.ActivityType.streaming
+
+    if name == "competing":
+        return discord.ActivityType.competing
+
+    return discord.ActivityType.playing
+
+
+def make_presence_activity(text: str, activity_type_value: Any, default_type: str) -> discord.BaseActivity | None:
+    text = text.strip()
+
+    if not text:
+        return None
+
+    activity_type = presence_activity_type(activity_type_value, default_type)
+
+    if activity_type == "custom":
+        return discord.CustomActivity(name=text)
+
+    return discord.Activity(type=activity_type, name=text)
+
+
+def current_watch_channel_name() -> str:
+    channel = bot.get_channel(int(state.get("watch_channel_id", config.get("watch_channel_id", 0))))
+
+    if isinstance(channel, discord.TextChannel):
+        return channel.name
+
+    return attempt_name(int(state.get("current_attempt", config.get("starting_attempt", 1))))
+
+
+def configured_presence_total_tokens() -> int | None:
+    cfg = presence_config()
+    raw_total = cfg.get("estimated_total_tokens")
+
+    if raw_total is None:
+        ollama_cfg = config.get("ollama", {})
+        options = ollama_cfg.get("options", {}) if isinstance(ollama_cfg, dict) else {}
+
+        if isinstance(options, dict):
+            raw_total = options.get("num_predict")
+
+    try:
+        total = int(raw_total)
+    except Exception:
+        return None
+
+    return total if total > 0 else None
+
+
+def configured_presence_update_every_tokens() -> int:
+    try:
+        value = int(presence_config().get("update_every_generated_tokens", 4))
+    except Exception:
+        value = 4
+
+    return max(1, value)
+
+
+def configured_presence_min_update_interval() -> float:
+    try:
+        value = float(presence_config().get("minimum_update_interval_seconds", 2.0))
+    except Exception:
+        value = 2.0
+
+    return max(0.0, value)
+
+
+def configured_presence_stream_scoring() -> bool:
+    return bool(presence_config().get("stream_ollama_scoring", True))
+
+
+def render_presence_template(
+    template: str,
+    *,
+    generated_tokens: int = 0,
+    total_tokens: int | None = None,
+) -> str:
+    attempt_number = int(state.get("current_attempt", config.get("starting_attempt", 1)))
+    channel_name = current_watch_channel_name()
+
+    if total_tokens is None:
+        total_text = "?"
+    else:
+        total_text = str(max(generated_tokens, total_tokens))
+
+    values = SafeFormatDict(
+        attempt=str(attempt_number),
+        attempt_name=attempt_name(attempt_number),
+        channel_id=str(state.get("watch_channel_id", "")),
+        channel_name=channel_name,
+        channel=f"#{channel_name}",
+        generated_tokens=str(generated_tokens),
+        total_tokens=total_text,
+        active_analyses=str(active_analysis_count),
+    )
+
+    try:
+        rendered = template.format_map(values)
+    except Exception as error:
+        rendered = f"{template} [template formatting error: {error}]"
+
+    return rendered[:128]
+
+
+def idle_presence_config() -> dict[str, Any]:
+    cfg = presence_config().get("idle", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def analyzing_presence_config() -> dict[str, Any]:
+    cfg = presence_config().get("analyzing", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+async def set_presence_text(text: str, *, activity_type_value: Any, default_type: str) -> None:
+    if not presence_enabled():
+        return
+
+    activity = make_presence_activity(text, activity_type_value, default_type)
+    await bot.change_presence(status=presence_status(), activity=activity)
+
+
+async def set_idle_presence() -> None:
+    if not presence_enabled():
+        return
+
+    cfg = idle_presence_config()
+    template = str(cfg.get("template", "#{channel_name}"))
+    text = render_presence_template(template)
+    await set_presence_text(text, activity_type_value=cfg.get("activity_type", "watching"), default_type="watching")
+
+
+async def set_analyzing_presence(
+    *,
+    generated_tokens: int,
+    total_tokens: int | None,
+    force: bool = False,
+) -> None:
+    global last_presence_update_at
+
+    if not presence_enabled():
+        return
+
+    now = time.monotonic()
+    update_every = configured_presence_update_every_tokens()
+    min_interval = configured_presence_min_update_interval()
+
+    if not force:
+        if generated_tokens % update_every != 0:
+            return
+
+        if now - last_presence_update_at < min_interval:
+            return
+
+    cfg = analyzing_presence_config()
+    template = str(cfg.get("template", "Analyzing {generated_tokens}/{total_tokens} tokens"))
+    text = render_presence_template(
+        template,
+        generated_tokens=generated_tokens,
+        total_tokens=total_tokens,
+    )
+
+    last_presence_update_at = now
+    await set_presence_text(text, activity_type_value=cfg.get("activity_type", "playing"), default_type="playing")
+
+
+async def begin_analysis_presence() -> int | None:
+    global active_analysis_count
+
+    if not presence_enabled():
+        return configured_presence_total_tokens()
+
+    async with presence_lock:
+        active_analysis_count += 1
+        total_tokens = configured_presence_total_tokens()
+        await set_analyzing_presence(generated_tokens=0, total_tokens=total_tokens, force=True)
+        return total_tokens
+
+
+async def update_analysis_presence(generated_tokens: int, total_tokens: int | None) -> None:
+    if not presence_enabled():
+        return
+
+    async with presence_lock:
+        if active_analysis_count <= 0:
+            return
+
+        await set_analyzing_presence(
+            generated_tokens=generated_tokens,
+            total_tokens=total_tokens,
+            force=False,
+        )
+
+
+async def finish_analysis_presence() -> None:
+    global active_analysis_count
+
+    if not presence_enabled():
+        return
+
+    async with presence_lock:
+        active_analysis_count = max(0, active_analysis_count - 1)
+
+        if active_analysis_count == 0:
+            await set_idle_presence()
+
+
 def render_new_channel_message_template(
     template: str,
     *,
@@ -1418,6 +1667,64 @@ async def post_ollama_generate(request_payload: dict[str, Any]) -> dict[str, Any
             return await response.json()
 
 
+async def post_ollama_generate_streaming(request_payload: dict[str, Any]) -> dict[str, Any]:
+    ollama_cfg = config["ollama"]
+    timeout = aiohttp.ClientTimeout(total=float(ollama_cfg.get("timeout_seconds", 30)))
+    streaming_payload = dict(request_payload)
+    streaming_payload["stream"] = True
+
+    generated_chunks = 0
+    total_tokens = configured_presence_total_tokens()
+    response_parts: list[str] = []
+    final_payload: dict[str, Any] = {}
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(ollama_cfg["url"], json=streaming_payload) as response:
+            response.raise_for_status()
+
+            while True:
+                raw_line = await response.content.readline()
+
+                if not raw_line:
+                    break
+
+                line = raw_line.decode("utf-8", errors="replace").strip()
+
+                if not line:
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                piece = str(chunk.get("response", ""))
+
+                if piece:
+                    response_parts.append(piece)
+                    generated_chunks += 1
+                    await update_analysis_presence(generated_chunks, total_tokens)
+
+                if chunk.get("done"):
+                    final_payload = chunk
+
+                    try:
+                        eval_count = int(chunk.get("eval_count"))
+                    except Exception:
+                        eval_count = 0
+
+                    if eval_count > 0:
+                        total_tokens = eval_count
+                        await update_analysis_presence(generated_chunks, total_tokens)
+
+                    break
+
+    payload = dict(final_payload)
+    payload["response"] = "".join(response_parts)
+    payload.setdefault("done", True)
+    return payload
+
+
 async def generate_reason_with_ollama(
     *,
     message_text: str,
@@ -1525,7 +1832,16 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
         "stream": False,
     }
 
-    payload = await post_ollama_generate(request_payload)
+    await begin_analysis_presence()
+
+    try:
+        if configured_presence_stream_scoring():
+            payload = await post_ollama_generate_streaming(request_payload)
+        else:
+            payload = await post_ollama_generate(request_payload)
+    finally:
+        await finish_analysis_presence()
+
     score = parse_ollama_response(payload)
 
     await store_message_score_record(
@@ -2000,6 +2316,11 @@ async def reset_attempt_from_message(
         save_json(STATE_PATH, state)
 
         try:
+            await set_idle_presence()
+        except Exception as error:
+            warnings.append(f"Presence update skipped: {error}")
+
+        try:
             await move_to_private_archive(old_channel, old_attempt, reason)
         except discord.Forbidden as error:
             raise RuntimeError(format_forbidden("Moving/privatizing the old attempt channel", error)) from error
@@ -2207,6 +2528,11 @@ async def on_ready() -> None:
         print(f"Synced {len(synced)} slash command(s).")
     except Exception as error:
         print(f"Failed to sync slash commands: {error}")
+
+    try:
+        await set_idle_presence()
+    except Exception as error:
+        print(f"Failed to set idle presence: {error}")
 
 
 @bot.event
@@ -2498,6 +2824,11 @@ async def set_attempt_channel(
     state["watch_channel_id"] = channel.id
     save_json(STATE_PATH, state)
 
+    try:
+        await set_idle_presence()
+    except Exception as error:
+        print(f"Failed to update idle presence after set-attempt-channel: {error}")
+
     await interaction.response.send_message(
         content=f"Now watching {channel.mention}.",
         ephemeral=True,
@@ -2678,6 +3009,11 @@ async def reset_attempts(interaction: discord.Interaction) -> None:
     state["current_attempt"] = attempt_number
     state["watch_channel_id"] = active_channel.id
     save_json(STATE_PATH, state)
+
+    try:
+        await set_idle_presence()
+    except Exception as error:
+        print(f"Failed to update idle presence after /reset: {error}")
 
     lines = [
         "Attempt state reset.",
