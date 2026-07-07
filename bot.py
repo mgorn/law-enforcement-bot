@@ -2733,7 +2733,6 @@ async def on_message(message: discord.Message) -> None:
         score = await score_message_with_ollama(message)
     except Exception as error:
         print(f"Failed to score message {message.id}: {error}")
-        await bot.process_commands(message)
         return
 
     score = apply_hard_moderation_overrides(message, score)
@@ -2747,7 +2746,6 @@ async def on_message(message: discord.Message) -> None:
     if not score_should_reset(score):
         await maybe_send_warning_actions(message, score)
         await maybe_log_non_triggered_message(message, score)
-        await bot.process_commands(message)
         return
 
     try:
@@ -2755,7 +2753,6 @@ async def on_message(message: discord.Message) -> None:
     except Exception as error:
         print(f"Failed to handle trigger for message {message.id}: {error}")
 
-    await bot.process_commands(message)
 
 
 @bot.tree.command(name="score", description="Show the stored moderation score for a message.")
