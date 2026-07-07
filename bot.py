@@ -44,32 +44,32 @@ VALID_LABELS = {
 DEFAULT_SCORE_METRICS = [
     {
         "tag": "embarrassment",
-        "description": "0.0 to 1.0 for how clownable or embarrassing the message is for the sender. This is social/funny cringe, not harm.",
+        "description": "-1.0 to 1.0 for how clownable or embarrassing the message is for the sender. Positive values mean more embarrassing/clownable; negative values mean notably composed, normal, or anti-cringe.",
         "weight": 1.0,
     },
     {
         "tag": "severity",
-        "description": "0.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is.",
+        "description": "-1.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is. Positive values mean more harmful; negative values mean notably safe, constructive, or de-escalating.",
         "weight": 2.0,
     },
     {
         "tag": "targetedness",
-        "description": "0.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. General venting is lower; direct @user or group-directed abuse is higher.",
+        "description": "-1.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. Positive values mean more targeted; negative values mean clearly not aimed at a real person/group or is explicitly de-targeted.",
         "weight": 1.0,
     },
     {
         "tag": "harassment",
-        "description": "0.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty.",
+        "description": "-1.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty. Positive values mean more harassment; negative values mean supportive, respectful, or de-escalating language.",
         "weight": 1.5,
     },
     {
         "tag": "threat",
-        "description": "0.0 to 1.0 for threats of violence or intent to harm. Fictional-character threats score lower than threats toward real people.",
+        "description": "-1.0 to 1.0 for threats of violence or intent to harm. Positive values mean more threatening; negative values mean explicitly peaceful, reassuring, or anti-violence.",
         "weight": 1.5,
     },
     {
         "tag": "certainty",
-        "description": "0.0 to 1.0 for context certainty / context completeness. 0.0 means important context is missing before taking action; 1.0 means the message itself provides enough context to judge.",
+        "description": "-1.0 to 1.0 for context certainty / context completeness. Positive values mean the message itself provides enough context to judge; negative values mean important context is missing or the message is highly ambiguous.",
         "weight": 1.0,
     },
 ]
@@ -166,7 +166,7 @@ def score_metrics_prompt_instructions() -> str:
 
 def score_metrics_json_schema() -> str:
     return json.dumps(
-        {tag: "number from 0.0 to 1.0" for tag in score_metric_tags()},
+        {tag: "number from -1.0 to 1.0" for tag in score_metric_tags()},
         indent=2,
         ensure_ascii=False,
     )
@@ -201,7 +201,7 @@ class ModerationScore:
 
     def metric_values(self) -> dict[str, float]:
         return {
-            tag: clamp01(self.metrics.get(tag, 0.0))
+            tag: clamp_metric_value(self.metrics.get(tag, 0.0))
             for tag in score_metric_tags()
         }
 
@@ -226,8 +226,8 @@ class ModerationScore:
 
         # Intentionally divide by the number of configured metrics, not the sum
         # of weights. This makes weights act as force multipliers for important
-        # metrics while keeping the output clamped to the 0.0-1.0 action range.
-        return clamp01(weighted_sum / len(metrics))
+        # metrics while keeping the output clamped to the -1.0 to 1.0 action range.
+        return clamp_metric_value(weighted_sum / len(metrics))
 
     @property
     def score(self) -> float:
@@ -1000,14 +1000,14 @@ def score_record_value(record: dict[str, Any], name: str, default: float = 0.0) 
         scores = {}
 
     if name in {"score", "total_score"}:
-        return clamp01(scores.get(name, default))
+        return clamp_metric_value(scores.get(name, default))
 
     metrics = scores.get("metrics", {})
 
     if not isinstance(metrics, dict):
         metrics = {}
 
-    return clamp01(metrics.get(name, default))
+    return clamp_metric_value(metrics.get(name, default))
 
 
 def format_stored_score_record(record: dict[str, Any]) -> str:
@@ -1061,7 +1061,7 @@ def format_stored_score_record(record: dict[str, Any]) -> str:
                 except Exception:
                     weight_value = 1.0
 
-                lines.append(f"{tag}: `{clamp01(value):.2f}` × weight `{weight_value:.2f}`")
+                lines.append(f"{tag}: `{clamp_metric_value(value):.2f}` × weight `{weight_value:.2f}`")
 
     if bool(cfg.get("show_decision_flags", True)):
         lines.extend(
@@ -1688,25 +1688,25 @@ def clean_for_prompt(text: str, max_len: int = 1800) -> str:
     return text
 
 
-def clamp01(value: Any) -> float:
+def clamp_metric_value(value: Any) -> float:
     try:
         number = float(value)
     except Exception:
         return 0.0
 
-    return max(0.0, min(1.0, number))
+    return max(-1.0, min(1.0, number))
 
 
 def parse_dimension(data: dict[str, Any], name: str, default: float = 0.0) -> float:
-    return clamp01(data.get(name, default))
+    return clamp_metric_value(data.get(name, default))
 
 
 def score_metrics_with_value(value: float, *, certainty: float | None = None) -> dict[str, float]:
-    metrics = {tag: clamp01(value) for tag in score_metric_tags()}
+    metrics = {tag: clamp_metric_value(value) for tag in score_metric_tags()}
     certainty_tag = configured_certainty_metric_tag()
 
     if certainty is not None and certainty_tag in metrics:
-        metrics[certainty_tag] = clamp01(certainty)
+        metrics[certainty_tag] = clamp_metric_value(certainty)
 
     return metrics
 

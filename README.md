@@ -2,7 +2,7 @@
 
 A Discord "moderation" bot built with `discord.py` and Ollama.
 
-The bot watches one public `attempt-X` channel. Each message is scored by a local Ollama model with a nastiness / severity score from `0.0` to `1.0`. If a message crosses the configured threshold, the bot archives the current channel into a private moderator category, creates the next attempt channel, assigns configured consequence roles, logs the incident for moderators, and writes structured JSONL records that can later be used for evaluation or training.
+The bot watches one public `attempt-X` channel. Each message is scored by a local Ollama model with configurable moderation metrics from `-1.0` to `1.0`. If a message crosses the configured threshold, the bot archives the current channel into a private moderator category, creates the next attempt channel, assigns configured consequence roles, logs the incident for moderators, and writes structured JSONL records that can later be used for evaluation or training.
 
 ## Features
 

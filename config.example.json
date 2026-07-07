@@ -196,32 +196,32 @@
   "score_metrics": [
     {
       "tag": "embarrassment",
-      "description": "0.0 to 1.0 for how clownable or embarrassing the message is for the sender. This is social/funny cringe, not harm.",
+      "description": "-1.0 to 1.0 for how clownable or embarrassing the message is for the sender. Positive values mean more embarrassing/clownable; negative values mean notably composed, normal, or anti-cringe.",
       "weight": 1.0
     },
     {
       "tag": "severity",
-      "description": "0.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is.",
+      "description": "-1.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is. Positive values mean more harmful; negative values mean notably safe, constructive, or de-escalating.",
       "weight": 2.0
     },
     {
       "tag": "targetedness",
-      "description": "0.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. General venting is lower; direct @user or group-directed abuse is higher.",
+      "description": "-1.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. Positive values mean more targeted; negative values mean clearly not aimed at a real person/group or is explicitly de-targeted.",
       "weight": 1.0
     },
     {
       "tag": "harassment",
-      "description": "0.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty.",
+      "description": "-1.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty. Positive values mean more harassment; negative values mean supportive, respectful, or de-escalating language.",
       "weight": 1.5
     },
     {
       "tag": "threat",
-      "description": "0.0 to 1.0 for threats of violence or intent to harm. Fictional-character threats score lower than threats toward real people.",
+      "description": "-1.0 to 1.0 for threats of violence or intent to harm. Positive values mean more threatening; negative values mean explicitly peaceful, reassuring, or anti-violence.",
       "weight": 1.5
     },
     {
       "tag": "certainty",
-      "description": "0.0 to 1.0 for context certainty / context completeness. 0.0 means important context is missing before taking action; 1.0 means the message itself provides enough context to judge.",
+      "description": "-1.0 to 1.0 for context certainty / context completeness. Positive values mean the message itself provides enough context to judge; negative values mean important context is missing or the message is highly ambiguous.",
       "weight": 1.0
     }
   ]
