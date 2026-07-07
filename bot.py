@@ -46,7 +46,7 @@ DIMENSION_FIELDS = (
     "targetedness",
     "harassment",
     "threat",
-    "ambiguity",
+    "certainty",
 )
 
 
@@ -57,7 +57,7 @@ class ModerationScore:
     targetedness: float = 0.0
     harassment: float = 0.0
     threat: float = 0.0
-    ambiguity: float = 1.0
+    certainty: float = 1.0
     override_score: float | None = None
     override_category: str | None = None
     override_reason: str | None = None
@@ -70,7 +70,7 @@ class ModerationScore:
             "targetedness": self.targetedness,
             "harassment": self.harassment,
             "threat": self.threat,
-            "ambiguity": self.ambiguity,
+            "certainty": self.certainty,
         }
 
     @property
@@ -103,7 +103,7 @@ class ModerationScore:
         if primary_value < 0.20:
             return "neutral"
 
-        if self.ambiguity < 0.35 and self.total_score >= 0.45:
+        if self.certainty < 0.35 and self.total_score >= 0.45:
             return "context_needed"
 
         return primary_name
@@ -120,7 +120,7 @@ class ModerationScore:
             f"targetedness={self.targetedness:.2f}, "
             f"harassment={self.harassment:.2f}, "
             f"threat={self.threat:.2f}, "
-            f"ambiguity={self.ambiguity:.2f}."
+            f"certainty={self.certainty:.2f}."
         )
 
     @property
@@ -128,10 +128,10 @@ class ModerationScore:
         if self.override_confidence is not None:
             return clamp01(self.override_confidence)
 
-        # The dimensional prompt uses ambiguity as "context completeness":
-        # 0.0 means context is missing, 1.0 means enough context is present.
+        # The dimensional prompt uses certainty as context certainty/completeness:
+        # 0.0 means context is missing/uncertain, 1.0 means enough context is present.
         # This is the closest compatibility value for older log/template fields.
-        return self.ambiguity
+        return self.certainty
 
 
 @dataclass
@@ -472,7 +472,7 @@ def apply_hard_moderation_overrides(
         targetedness=score.targetedness,
         harassment=score.harassment,
         threat=score.threat,
-        ambiguity=max(score.ambiguity, hard_override_confidence(default=1.0)),
+        certainty=max(score.certainty, hard_override_confidence(default=1.0)),
         override_score=override_score,
         override_category=category,
         override_reason=(
@@ -512,6 +512,9 @@ def moderation_score_value(score: ModerationScore, field: Any = "score") -> floa
     if field_name in {"total", "total_score", "average"}:
         return score.total_score
 
+    if field_name == "ambiguity":
+        return score.certainty
+
     if field_name in DIMENSION_FIELDS:
         return score.dimension_values()[field_name]
 
@@ -542,7 +545,7 @@ def score_needs_moderator_review(score: ModerationScore) -> bool:
     if max(score.severity, score.targetedness, score.harassment, score.threat) >= any_dimension_score:
         return True
 
-    if score.ambiguity <= low_context_threshold and score.total_score >= low_context_min_score:
+    if score.certainty <= low_context_threshold and score.total_score >= low_context_min_score:
         return True
 
     return False
@@ -567,11 +570,14 @@ def score_should_reset(score: ModerationScore) -> bool:
     if score.override_score is not None:
         return True
 
-    minimum_ambiguity = thresholds_cfg.get("minimum_ambiguity_for_reset")
+    minimum_certainty = thresholds_cfg.get(
+        "minimum_certainty_for_reset",
+        thresholds_cfg.get("minimum_ambiguity_for_reset"),
+    )
 
-    if minimum_ambiguity is not None:
+    if minimum_certainty is not None:
         try:
-            if score.ambiguity < float(minimum_ambiguity):
+            if score.certainty < float(minimum_certainty):
                 return False
         except Exception:
             pass
@@ -710,7 +716,9 @@ def render_new_channel_message_template(
         targetedness=f"{score.targetedness:.2f}",
         harassment=f"{score.harassment:.2f}",
         threat=f"{score.threat:.2f}",
-        ambiguity=f"{score.ambiguity:.2f}",
+        certainty=f"{score.certainty:.2f}",
+        context_certainty=f"{score.certainty:.2f}",
+        ambiguity=f"{score.certainty:.2f}",
         category=score.category,
         reason=score.reason,
         confidence=f"{score.confidence:.2f}",
@@ -759,7 +767,9 @@ def render_warning_reply_template(
         targetedness=f"{score.targetedness:.2f}",
         harassment=f"{score.harassment:.2f}",
         threat=f"{score.threat:.2f}",
-        ambiguity=f"{score.ambiguity:.2f}",
+        certainty=f"{score.certainty:.2f}",
+        context_certainty=f"{score.certainty:.2f}",
+        ambiguity=f"{score.certainty:.2f}",
         category=score.category,
         reason=score.reason,
         confidence=f"{score.confidence:.2f}",
@@ -982,20 +992,20 @@ def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return ModerationScore(
-            ambiguity=0.0,
+            certainty=0.0,
             override_category="parse_error",
             override_reason="The moderation model did not return valid JSON.",
             override_confidence=0.0,
         )
 
-    if any(field in data for field in DIMENSION_FIELDS):
+    if any(field in data for field in DIMENSION_FIELDS) or "ambiguity" in data:
         return ModerationScore(
             embarrassment=parse_dimension(data, "embarrassment", 0.0),
             severity=parse_dimension(data, "severity", 0.0),
             targetedness=parse_dimension(data, "targetedness", 0.0),
             harassment=parse_dimension(data, "harassment", 0.0),
             threat=parse_dimension(data, "threat", 0.0),
-            ambiguity=parse_dimension(data, "ambiguity", 1.0),
+            certainty=parse_dimension(data, "certainty", parse_dimension(data, "ambiguity", 1.0)),
         )
 
     # Backward compatibility for older prompts/configs that returned the old
@@ -1006,7 +1016,7 @@ def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
     return ModerationScore(
         severity=legacy_score,
         harassment=legacy_score,
-        ambiguity=clamp01(data.get("confidence", 1.0)),
+        certainty=clamp01(data.get("confidence", 1.0)),
         override_category=str(data.get("category", "legacy_score"))[:80],
         override_reason=str(data.get("reason", "Legacy moderation score."))[:500],
         override_confidence=clamp01(data.get("confidence", 1.0)),
@@ -1094,7 +1104,7 @@ def make_training_record(
         "ollama_targetedness": score.targetedness,
         "ollama_harassment": score.harassment,
         "ollama_threat": score.threat,
-        "ollama_ambiguity": score.ambiguity,
+        "ollama_certainty": score.certainty,
         "ollama_moderator_review": score_needs_moderator_review(score),
         "ollama_reset_recommended": score_should_reset(score),
         "strikes_after": strikes_after,
@@ -1126,7 +1136,7 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
 
     if not message_text and not message.attachments:
         return ModerationScore(
-            ambiguity=1.0,
+            certainty=1.0,
             override_category="empty",
             override_reason="No text content or attachments to evaluate.",
             override_confidence=1.0,
@@ -1467,7 +1477,7 @@ async def send_incident_review(
             f"targetedness={score.targetedness:.2f}, "
             f"harassment={score.harassment:.2f}, "
             f"threat={score.threat:.2f}, "
-            f"ambiguity={score.ambiguity:.2f}"
+            f"certainty={score.certainty:.2f}"
         ),
         inline=False,
     )
@@ -1882,7 +1892,7 @@ async def on_message(message: discord.Message) -> None:
         f"score={score.score:.2f} total={score.total_score:.2f} "
         f"embarrassment={score.embarrassment:.2f} severity={score.severity:.2f} "
         f"targetedness={score.targetedness:.2f} harassment={score.harassment:.2f} "
-        f"threat={score.threat:.2f} ambiguity={score.ambiguity:.2f} "
+        f"threat={score.threat:.2f} certainty={score.certainty:.2f} "
         f"category={score.category!r}"
     )
 
@@ -1951,7 +1961,7 @@ async def nuke(
 
     if silent:
         score = ModerationScore(
-            ambiguity=1.0,
+            certainty=1.0,
             override_score=0.0,
             override_category="manual_silent_nuke",
             override_reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
@@ -1964,7 +1974,7 @@ async def nuke(
             targetedness=1.0,
             harassment=1.0,
             threat=1.0,
-            ambiguity=1.0,
+            certainty=1.0,
             override_score=1.0,
             override_category="manual_nuke",
             override_reason="A moderator manually marked this message as severe enough to reset the attempt.",
@@ -2024,7 +2034,7 @@ async def nuke_context_menu(
         targetedness=1.0,
         harassment=1.0,
         threat=1.0,
-        ambiguity=1.0,
+        certainty=1.0,
         override_score=1.0,
         override_category="manual_context_menu_nuke",
         override_reason="A moderator manually marked this message as severe enough to reset the attempt.",
@@ -2073,7 +2083,7 @@ async def silent_nuke_context_menu(
         return
 
     score = ModerationScore(
-        ambiguity=1.0,
+        certainty=1.0,
         override_score=0.0,
         override_category="manual_silent_context_menu_nuke",
         override_reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",

@@ -22,7 +22,7 @@
     "moderator_review_any_dimension_score": 0.75,
     "low_context_threshold": 0.35,
     "low_context_min_score": 0.45,
-    "minimum_ambiguity_for_reset": 0.5,
+    "minimum_certainty_for_reset": 0.5,
     "require_all_dimensions": false,
     "all_dimensions_threshold": 0.91
   },
@@ -60,7 +60,7 @@
     ],
     "replies": [
       "{user_mention}, easy there. Score: `{score}`. Severity: `{severity}`. Harassment: `{harassment}`. Threat: `{threat}`.",
-      "Warning for {user_mention}: total `{total_score}`, category **{category}**. Context completeness: `{ambiguity}`."
+      "Warning for {user_mention}: total `{total_score}`, category **{category}**. Certainty: `{certainty}`."
     ],
     "allowed_mentions": {
       "users": true,
