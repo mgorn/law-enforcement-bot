@@ -106,8 +106,14 @@ def main() -> int:
                 "text": text,
                 "label": label,
                 "score_target": score_target,
-                "ollama_score": record.get("ollama_score"),
-                "ollama_category": record.get("ollama_category"),
+                "score": record.get("score"),
+                "reason": record.get("reason"),
+                "embarrassment": record.get("embarrassment"),
+                "severity": record.get("severity"),
+                "targetedness": record.get("targetedness"),
+                "harassment": record.get("harassment"),
+                "threat": record.get("threat"),
+                "certainty": record.get("certainty"),
                 "appeal_result": record.get("appeal_result"),
             }
         )

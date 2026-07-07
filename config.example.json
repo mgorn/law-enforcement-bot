@@ -12,32 +12,31 @@
     "url": "http://127.0.0.1:11434/api/generate",
     "model": "llama3.1:8b",
     "timeout_seconds": 30,
-    "prompt_path": "prompt.txt"
+    "prompt_path": "prompt.txt",
+    "reason_prompt_path": "reason_prompt.txt",
+    "generate_reason": true
   },
   "thresholds": {
     "trigger_score": 0.91,
     "trigger_score_field": "score",
-    "instant_escalation_score": 0.95,
     "moderator_review_score": 0.65,
     "moderator_review_any_dimension_score": 0.75,
-    "low_context_threshold": 0.35,
-    "low_context_min_score": 0.45,
     "minimum_certainty_for_reset": 0.5,
     "require_all_dimensions": false,
-    "all_dimensions_threshold": 0.91
+    "all_dimensions_threshold": 0.91,
+    "uncertain_review_certainty_threshold": 0.35,
+    "uncertain_review_min_score": 0.45
   },
   "hard_moderation_overrides": {
     "enabled": true,
-    "score": 0.95,
-    "confidence": 1.0,
     "banned_terms": {
       "enabled": true,
       "include_builtin_terms": true,
       "terms": [
         "nigger"
       ],
-      "category": "banned_term_override",
-      "reason": "Message contains a configured banned term."
+      "reason": "Message contains a configured banned term.",
+      "reset": true
     }
   },
   "warning_reactions": {
@@ -60,7 +59,7 @@
     ],
     "replies": [
       "{user_mention}, easy there. Score: `{score}`. Severity: `{severity}`. Harassment: `{harassment}`. Threat: `{threat}`.",
-      "Warning for {user_mention}: total `{total_score}`, category **{category}**. Certainty: `{certainty}`."
+      "Warning for {user_mention}: total `{total_score}`. Certainty: `{certainty}`. Reason: {reason}"
     ],
     "allowed_mentions": {
       "users": true,
@@ -95,8 +94,8 @@
     "send_on_silent": true,
     "templates": [
       "Everyone thank {user_mention} for ruining it for everyone. Score: `{score}`. Severity: `{severity}`.",
-      "{user_mention} got us to **{attempt_name}**. Total: `{total_score}`. Category: **{category}**.",
-      "Welcome to **{attempt_name}**. The previous attempt was archived for: **{category}**."
+      "{user_mention} got us to **{attempt_name}**. Total: `{total_score}`. Reason: {reason}",
+      "Welcome to **{attempt_name}**. The previous attempt was archived. Reason: {reason}"
     ],
     "allowed_mentions": {
       "users": true,
@@ -136,8 +135,5 @@
     "sample_non_triggered": true,
     "non_triggered_sample_rate": 0.02,
     "minimum_score_to_log_non_triggered": 0.55
-  },
-  "archive": {
-    "preserve_trigger_message": true
   }
 }

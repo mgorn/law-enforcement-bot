@@ -51,4 +51,4 @@ Calibration examples:
 - "I'm going to kill Darth Vader" -> embarrassment 0.15, severity 0.25, targetedness 0.05, harassment 0.05, threat 0.25, certainty 1.00
 - a direct banned slur used by itself or as an insult -> embarrassment 0.40, severity 0.95, targetedness 0.70, harassment 0.90, threat 0.00, certainty 0.95
 
-Return numbers only, each clamped between 0.0 and 1.0. Do not include category, reason, confidence, moderator_review, reset_recommended, markdown, or explanatory prose.
+Return numbers only, each clamped between 0.0 and 1.0. Do not include markdown, explanatory prose, or any fields other than the six numeric fields listed above.
