@@ -15,8 +15,16 @@
     "prompt_path": "prompt.txt"
   },
   "thresholds": {
-    "trigger_score": 0.85,
-    "instant_escalation_score": 0.95
+    "trigger_score": 0.91,
+    "trigger_score_field": "score",
+    "instant_escalation_score": 0.95,
+    "moderator_review_score": 0.65,
+    "moderator_review_any_dimension_score": 0.75,
+    "low_context_threshold": 0.35,
+    "low_context_min_score": 0.45,
+    "minimum_ambiguity_for_reset": 0.5,
+    "require_all_dimensions": false,
+    "all_dimensions_threshold": 0.91
   },
   "hard_moderation_overrides": {
     "enabled": true,
@@ -25,7 +33,9 @@
     "banned_terms": {
       "enabled": true,
       "include_builtin_terms": true,
-      "terms": [ "nigger" ],
+      "terms": [
+        "nigger"
+      ],
       "category": "banned_term_override",
       "reason": "Message contains a configured banned term."
     }
@@ -38,7 +48,9 @@
     ],
     "reactions": [
       "⚠️"
-    ]
+    ],
+    "use_moderator_review": true,
+    "score_field": "score"
   },
   "warning_replies": {
     "enabled": false,
@@ -47,14 +59,16 @@
       0.85
     ],
     "replies": [
-      "{user_mention}, easy there. Category: **{category}**. Score: `{score}`. Reason: {reason}",
-      "Warning for {user_mention}: this scored `{score}` for **{category}**."
+      "{user_mention}, easy there. Score: `{score}`. Severity: `{severity}`. Harassment: `{harassment}`. Threat: `{threat}`.",
+      "Warning for {user_mention}: total `{total_score}`, category **{category}**. Context completeness: `{ambiguity}`."
     ],
     "allowed_mentions": {
       "users": true,
       "roles": false,
       "everyone": false
-    }
+    },
+    "use_moderator_review": true,
+    "score_field": "score"
   },
   "consequence_roles": {
     "enabled": true,
@@ -80,9 +94,9 @@
     "enabled": true,
     "send_on_silent": true,
     "templates": [
-      "Everyone thank {user_mention} for ruining it for everyone. Reason: {reason}",
-      "{user_mention} got us to **{attempt_name}**. Category: **{category}**. Score: `{score}`",
-      "Welcome to **{attempt_name}**. The previous attempt was archived for: **{category}**"
+      "Everyone thank {user_mention} for ruining it for everyone. Score: `{score}`. Severity: `{severity}`.",
+      "{user_mention} got us to **{attempt_name}**. Total: `{total_score}`. Category: **{category}**.",
+      "Welcome to **{attempt_name}**. The previous attempt was archived for: **{category}**."
     ],
     "allowed_mentions": {
       "users": true,

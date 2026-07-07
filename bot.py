@@ -40,12 +40,98 @@ VALID_LABELS = {
 }
 
 
+DIMENSION_FIELDS = (
+    "embarrassment",
+    "severity",
+    "targetedness",
+    "harassment",
+    "threat",
+    "ambiguity",
+)
+
+
 @dataclass
 class ModerationScore:
-    score: float
-    category: str
-    reason: str
-    confidence: float
+    embarrassment: float = 0.0
+    severity: float = 0.0
+    targetedness: float = 0.0
+    harassment: float = 0.0
+    threat: float = 0.0
+    ambiguity: float = 1.0
+    override_score: float | None = None
+    override_category: str | None = None
+    override_reason: str | None = None
+    override_confidence: float | None = None
+
+    def dimension_values(self) -> dict[str, float]:
+        return {
+            "embarrassment": self.embarrassment,
+            "severity": self.severity,
+            "targetedness": self.targetedness,
+            "harassment": self.harassment,
+            "threat": self.threat,
+            "ambiguity": self.ambiguity,
+        }
+
+    @property
+    def total_score(self) -> float:
+        values = self.dimension_values().values()
+        return clamp01(sum(values) / len(DIMENSION_FIELDS))
+
+    @property
+    def score(self) -> float:
+        if self.override_score is None:
+            return self.total_score
+
+        return max(self.total_score, clamp01(self.override_score))
+
+    @property
+    def category(self) -> str:
+        if self.override_category:
+            return self.override_category
+
+        action_dimensions = {
+            "embarrassment": self.embarrassment,
+            "severity": self.severity,
+            "targetedness": self.targetedness,
+            "harassment": self.harassment,
+            "threat": self.threat,
+        }
+
+        primary_name, primary_value = max(action_dimensions.items(), key=lambda item: item[1])
+
+        if primary_value < 0.20:
+            return "neutral"
+
+        if self.ambiguity < 0.35 and self.total_score >= 0.45:
+            return "context_needed"
+
+        return primary_name
+
+    @property
+    def reason(self) -> str:
+        if self.override_reason:
+            return self.override_reason
+
+        return (
+            "Dimensional moderation scores: "
+            f"embarrassment={self.embarrassment:.2f}, "
+            f"severity={self.severity:.2f}, "
+            f"targetedness={self.targetedness:.2f}, "
+            f"harassment={self.harassment:.2f}, "
+            f"threat={self.threat:.2f}, "
+            f"ambiguity={self.ambiguity:.2f}."
+        )
+
+    @property
+    def confidence(self) -> float:
+        if self.override_confidence is not None:
+            return clamp01(self.override_confidence)
+
+        # The dimensional prompt uses ambiguity as "context completeness":
+        # 0.0 means context is missing, 1.0 means enough context is present.
+        # This is the closest compatibility value for older log/template fields.
+        return self.ambiguity
 
 
 @dataclass
@@ -381,13 +467,19 @@ def apply_hard_moderation_overrides(
     )[:500]
 
     return ModerationScore(
-        score=override_score,
-        category=category,
-        reason=(
-            f"{reason} Original model score was {score.score:.2f} "
+        embarrassment=score.embarrassment,
+        severity=score.severity,
+        targetedness=score.targetedness,
+        harassment=score.harassment,
+        threat=score.threat,
+        ambiguity=max(score.ambiguity, hard_override_confidence(default=1.0)),
+        override_score=override_score,
+        override_category=category,
+        override_reason=(
+            f"{reason} Original dimensional score was {score.total_score:.2f} "
             f"with category {score.category!r}."
         )[:500],
-        confidence=max(score.confidence, hard_override_confidence(default=1.0)),
+        override_confidence=max(score.confidence, hard_override_confidence(default=1.0)),
     )
 
 
@@ -411,8 +503,101 @@ def threshold_matches(score_value: float, threshold: Any, default: float = 0.70)
     return score_value >= low
 
 
+def moderation_score_value(score: ModerationScore, field: Any = "score") -> float:
+    field_name = str(field or "score").strip().lower()
+
+    if field_name in {"score", "action_score"}:
+        return score.score
+
+    if field_name in {"total", "total_score", "average"}:
+        return score.total_score
+
+    if field_name in DIMENSION_FIELDS:
+        return score.dimension_values()[field_name]
+
+    return score.score
+
+
+def threshold_float(name: str, default: float) -> float:
+    thresholds_cfg = config.get("thresholds", {})
+
+    if not isinstance(thresholds_cfg, dict):
+        return default
+
+    try:
+        return float(thresholds_cfg.get(name, default))
+    except Exception:
+        return default
+
+
+def score_needs_moderator_review(score: ModerationScore) -> bool:
+    review_score = threshold_float("moderator_review_score", 0.65)
+    any_dimension_score = threshold_float("moderator_review_any_dimension_score", 0.75)
+    low_context_threshold = threshold_float("low_context_threshold", 0.35)
+    low_context_min_score = threshold_float("low_context_min_score", 0.45)
+
+    if score.score >= review_score:
+        return True
+
+    if max(score.severity, score.targetedness, score.harassment, score.threat) >= any_dimension_score:
+        return True
+
+    if score.ambiguity <= low_context_threshold and score.total_score >= low_context_min_score:
+        return True
+
+    return False
+
+
+def score_should_reset(score: ModerationScore) -> bool:
+    thresholds_cfg = config.get("thresholds", {})
+
+    if not isinstance(thresholds_cfg, dict):
+        thresholds_cfg = {}
+
+    try:
+        trigger_score = float(thresholds_cfg.get("trigger_score", 0.91))
+    except Exception:
+        trigger_score = 0.91
+
+    trigger_field = thresholds_cfg.get("trigger_score_field", "score")
+
+    if moderation_score_value(score, trigger_field) < trigger_score:
+        return False
+
+    if score.override_score is not None:
+        return True
+
+    minimum_ambiguity = thresholds_cfg.get("minimum_ambiguity_for_reset")
+
+    if minimum_ambiguity is not None:
+        try:
+            if score.ambiguity < float(minimum_ambiguity):
+                return False
+        except Exception:
+            pass
+
+    if bool(thresholds_cfg.get("require_all_dimensions", False)):
+        try:
+            all_dimensions_threshold = float(thresholds_cfg.get("all_dimensions_threshold", trigger_score))
+        except Exception:
+            all_dimensions_threshold = trigger_score
+
+        if any(value < all_dimensions_threshold for value in score.dimension_values().values()):
+            return False
+
+    return True
+
+
 def warning_threshold_matches(score: ModerationScore, cfg: dict[str, Any]) -> bool:
-    return threshold_matches(score.score, cfg.get("threshold"), default=0.70)
+    if bool(cfg.get("use_moderator_review", False)) and score_needs_moderator_review(score):
+        return True
+
+    score_field = cfg.get("score_field", "score")
+    return threshold_matches(
+        moderation_score_value(score, score_field),
+        cfg.get("threshold"),
+        default=0.70,
+    )
 
 
 
@@ -519,9 +704,18 @@ def render_new_channel_message_template(
         previous_attempt=str(previous_attempt_number),
         previous_attempt_name=attempt_name(previous_attempt_number),
         score=f"{score.score:.2f}",
+        total_score=f"{score.total_score:.2f}",
+        embarrassment=f"{score.embarrassment:.2f}",
+        severity=f"{score.severity:.2f}",
+        targetedness=f"{score.targetedness:.2f}",
+        harassment=f"{score.harassment:.2f}",
+        threat=f"{score.threat:.2f}",
+        ambiguity=f"{score.ambiguity:.2f}",
         category=score.category,
         reason=score.reason,
         confidence=f"{score.confidence:.2f}",
+        moderator_review=str(score_needs_moderator_review(score)).lower(),
+        reset_recommended=str(score_should_reset(score)).lower(),
         channel_mention=new_channel.mention,
         channel_name=new_channel.name,
         manual=str(manual).lower(),
@@ -559,9 +753,18 @@ def render_warning_reply_template(
         previous_attempt=str(attempt_number),
         previous_attempt_name=attempt_name(attempt_number),
         score=f"{score.score:.2f}",
+        total_score=f"{score.total_score:.2f}",
+        embarrassment=f"{score.embarrassment:.2f}",
+        severity=f"{score.severity:.2f}",
+        targetedness=f"{score.targetedness:.2f}",
+        harassment=f"{score.harassment:.2f}",
+        threat=f"{score.threat:.2f}",
+        ambiguity=f"{score.ambiguity:.2f}",
         category=score.category,
         reason=score.reason,
         confidence=f"{score.confidence:.2f}",
+        moderator_review=str(score_needs_moderator_review(score)).lower(),
+        reset_recommended=str(score_should_reset(score)).lower(),
         channel_mention=getattr(channel, "mention", ""),
         channel_name=getattr(channel, "name", str(channel)),
         message_id=str(message.id),
@@ -768,6 +971,10 @@ def clamp01(value: Any) -> float:
     return max(0.0, min(1.0, number))
 
 
+def parse_dimension(data: dict[str, Any], name: str, default: float = 0.0) -> float:
+    return clamp01(data.get(name, default))
+
+
 def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
     raw = payload.get("response", "{}")
 
@@ -775,17 +982,34 @@ def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return ModerationScore(
-            score=0.0,
-            category="parse_error",
-            reason="The moderation model did not return valid JSON.",
-            confidence=0.0,
+            ambiguity=0.0,
+            override_category="parse_error",
+            override_reason="The moderation model did not return valid JSON.",
+            override_confidence=0.0,
         )
 
+    if any(field in data for field in DIMENSION_FIELDS):
+        return ModerationScore(
+            embarrassment=parse_dimension(data, "embarrassment", 0.0),
+            severity=parse_dimension(data, "severity", 0.0),
+            targetedness=parse_dimension(data, "targetedness", 0.0),
+            harassment=parse_dimension(data, "harassment", 0.0),
+            threat=parse_dimension(data, "threat", 0.0),
+            ambiguity=parse_dimension(data, "ambiguity", 1.0),
+        )
+
+    # Backward compatibility for older prompts/configs that returned the old
+    # {score, category, reason, confidence} shape. New prompt.txt files should
+    # return only the six dimensional numeric fields.
+    legacy_score = clamp01(data.get("score", 0.0))
+
     return ModerationScore(
-        score=clamp01(data.get("score", 0.0)),
-        category=str(data.get("category", "unknown"))[:80],
-        reason=str(data.get("reason", "No reason provided."))[:500],
-        confidence=clamp01(data.get("confidence", 0.0)),
+        severity=legacy_score,
+        harassment=legacy_score,
+        ambiguity=clamp01(data.get("confidence", 1.0)),
+        override_category=str(data.get("category", "legacy_score"))[:80],
+        override_reason=str(data.get("reason", "Legacy moderation score."))[:500],
+        override_confidence=clamp01(data.get("confidence", 1.0)),
     )
 
 
@@ -861,9 +1085,18 @@ def make_training_record(
         "manual": manual,
         "silent": silent,
         "ollama_score": score.score,
+        "ollama_total_score": score.total_score,
         "ollama_category": score.category,
         "ollama_reason": score.reason,
         "ollama_confidence": score.confidence,
+        "ollama_embarrassment": score.embarrassment,
+        "ollama_severity": score.severity,
+        "ollama_targetedness": score.targetedness,
+        "ollama_harassment": score.harassment,
+        "ollama_threat": score.threat,
+        "ollama_ambiguity": score.ambiguity,
+        "ollama_moderator_review": score_needs_moderator_review(score),
+        "ollama_reset_recommended": score_should_reset(score),
         "strikes_after": strikes_after,
         "consequence_tier": consequence_tier,
         "banned": banned,
@@ -893,10 +1126,10 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
 
     if not message_text and not message.attachments:
         return ModerationScore(
-            score=0.0,
-            category="empty",
-            reason="No text content or attachments to evaluate.",
-            confidence=1.0,
+            ambiguity=1.0,
+            override_category="empty",
+            override_reason="No text content or attachments to evaluate.",
+            override_confidence=1.0,
         )
 
     attachment_summary = []
@@ -1224,8 +1457,20 @@ async def send_incident_review(
 
     embed = discord.Embed(title="Attempt reset incident", color=discord.Color.red())
     embed.add_field(name="Score", value=f"{score.score:.2f}", inline=True)
-    embed.add_field(name="Confidence", value=f"{score.confidence:.2f}", inline=True)
+    embed.add_field(name="Total", value=f"{score.total_score:.2f}", inline=True)
     embed.add_field(name="Category", value=score.category, inline=True)
+    embed.add_field(
+        name="Dimensions",
+        value=(
+            f"embarrassment={score.embarrassment:.2f}, "
+            f"severity={score.severity:.2f}, "
+            f"targetedness={score.targetedness:.2f}, "
+            f"harassment={score.harassment:.2f}, "
+            f"threat={score.threat:.2f}, "
+            f"ambiguity={score.ambiguity:.2f}"
+        ),
+        inline=False,
+    )
     embed.add_field(name="User", value=f"{message.author} / `{message.author.id}`", inline=False)
     embed.add_field(name="Strikes", value=str(strikes), inline=True)
     embed.add_field(name="Tier", value=str(consequence_tier or "none"), inline=True)
@@ -1257,6 +1502,7 @@ async def send_archive_notice(
             "Locked: this attempt has been archived for moderator review.\n\n"
             f"New channel: {new_channel.mention}\n"
             f"Moderation score: `{score.score:.2f}`\n"
+            f"Dimensional total: `{score.total_score:.2f}`\n"
             f"Category: `{score.category}`"
         ),
         allowed_mentions=discord.AllowedMentions.none(),
@@ -1633,12 +1879,14 @@ async def on_message(message: discord.Message) -> None:
 
     print(
         f"message={message.id} user={message.author.id} "
-        f"score={score.score:.2f} category={score.category!r}"
+        f"score={score.score:.2f} total={score.total_score:.2f} "
+        f"embarrassment={score.embarrassment:.2f} severity={score.severity:.2f} "
+        f"targetedness={score.targetedness:.2f} harassment={score.harassment:.2f} "
+        f"threat={score.threat:.2f} ambiguity={score.ambiguity:.2f} "
+        f"category={score.category!r}"
     )
 
-    trigger_threshold = float(config["thresholds"]["trigger_score"])
-
-    if score.score < trigger_threshold:
+    if not score_should_reset(score):
         await maybe_send_warning_actions(message, score)
         await maybe_log_non_triggered_message(message, score)
         await bot.process_commands(message)
@@ -1703,17 +1951,24 @@ async def nuke(
 
     if silent:
         score = ModerationScore(
-            score=0.0,
-            category="manual_silent_nuke",
-            reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
-            confidence=1.0,
+            ambiguity=1.0,
+            override_score=0.0,
+            override_category="manual_silent_nuke",
+            override_reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
+            override_confidence=1.0,
         )
     else:
         score = ModerationScore(
-            score=1.0,
-            category="manual_nuke",
-            reason="A moderator manually marked this message as severe enough to reset the attempt.",
-            confidence=1.0,
+            embarrassment=1.0,
+            severity=1.0,
+            targetedness=1.0,
+            harassment=1.0,
+            threat=1.0,
+            ambiguity=1.0,
+            override_score=1.0,
+            override_category="manual_nuke",
+            override_reason="A moderator manually marked this message as severe enough to reset the attempt.",
+            override_confidence=1.0,
         )
 
     try:
@@ -1764,10 +2019,16 @@ async def nuke_context_menu(
         return
 
     score = ModerationScore(
-        score=1.0,
-        category="manual_context_menu_nuke",
-        reason="A moderator manually marked this message as severe enough to reset the attempt.",
-        confidence=1.0,
+        embarrassment=1.0,
+        severity=1.0,
+        targetedness=1.0,
+        harassment=1.0,
+        threat=1.0,
+        ambiguity=1.0,
+        override_score=1.0,
+        override_category="manual_context_menu_nuke",
+        override_reason="A moderator manually marked this message as severe enough to reset the attempt.",
+        override_confidence=1.0,
     )
 
     try:
@@ -1812,10 +2073,11 @@ async def silent_nuke_context_menu(
         return
 
     score = ModerationScore(
-        score=0.0,
-        category="manual_silent_context_menu_nuke",
-        reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
-        confidence=1.0,
+        ambiguity=1.0,
+        override_score=0.0,
+        override_category="manual_silent_context_menu_nuke",
+        override_reason="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
+        override_confidence=1.0,
     )
 
     try:
