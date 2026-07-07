@@ -4,7 +4,7 @@ import random
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,48 +41,203 @@ VALID_LABELS = {
 }
 
 
-DIMENSION_FIELDS = (
-    "embarrassment",
-    "severity",
-    "targetedness",
-    "harassment",
-    "threat",
-    "certainty",
-)
+DEFAULT_SCORE_METRICS = [
+    {
+        "tag": "embarrassment",
+        "description": "0.0 to 1.0 for how clownable or embarrassing the message is for the sender. This is social/funny cringe, not harm.",
+        "weight": 1.0,
+    },
+    {
+        "tag": "severity",
+        "description": "0.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is.",
+        "weight": 2.0,
+    },
+    {
+        "tag": "targetedness",
+        "description": "0.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. General venting is lower; direct @user or group-directed abuse is higher.",
+        "weight": 1.0,
+    },
+    {
+        "tag": "harassment",
+        "description": "0.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty.",
+        "weight": 1.5,
+    },
+    {
+        "tag": "threat",
+        "description": "0.0 to 1.0 for threats of violence or intent to harm. Fictional-character threats score lower than threats toward real people.",
+        "weight": 1.5,
+    },
+    {
+        "tag": "certainty",
+        "description": "0.0 to 1.0 for context certainty / context completeness. 0.0 means important context is missing before taking action; 1.0 means the message itself provides enough context to judge.",
+        "weight": 1.0,
+    },
+]
+
+SCORE_METRIC_TAG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalized_score_metric(metric: Any) -> dict[str, Any] | None:
+    if not isinstance(metric, dict):
+        return None
+
+    tag = str(metric.get("tag", "")).strip()
+
+    if not SCORE_METRIC_TAG_RE.fullmatch(tag):
+        return None
+
+    description = str(metric.get("description", "")).strip()
+
+    if not description:
+        return None
+
+    try:
+        weight = float(metric.get("weight", 1.0))
+    except Exception:
+        weight = 1.0
+
+    if weight < 0.0:
+        weight = 0.0
+
+    return {
+        "tag": tag,
+        "description": description,
+        "weight": weight,
+    }
+
+
+def configured_score_metrics() -> list[dict[str, Any]]:
+    raw_metrics = config.get("score_metrics", DEFAULT_SCORE_METRICS)
+
+    if not isinstance(raw_metrics, list):
+        raw_metrics = DEFAULT_SCORE_METRICS
+
+    metrics: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for raw_metric in raw_metrics:
+        metric = normalized_score_metric(raw_metric)
+
+        if metric is None:
+            continue
+
+        tag = metric["tag"]
+
+        if tag in seen:
+            continue
+
+        seen.add(tag)
+        metrics.append(metric)
+
+    if metrics:
+        return metrics
+
+    return [metric for metric in (normalized_score_metric(item) for item in DEFAULT_SCORE_METRICS) if metric is not None]
+
+
+def score_metric_tags() -> list[str]:
+    return [metric["tag"] for metric in configured_score_metrics()]
+
+
+def score_metric_weights() -> dict[str, float]:
+    return {
+        metric["tag"]: float(metric.get("weight", 1.0))
+        for metric in configured_score_metrics()
+    }
+
+
+def score_metric_descriptions() -> dict[str, str]:
+    return {
+        metric["tag"]: str(metric.get("description", ""))
+        for metric in configured_score_metrics()
+    }
+
+
+def score_metrics_prompt_instructions() -> str:
+    lines = []
+
+    for metric in configured_score_metrics():
+        lines.append(
+            f'- "{metric["tag"]}": {metric["description"]} Weight for bot action score: {metric["weight"]}.'
+        )
+
+    return "\n".join(lines)
+
+
+def score_metrics_json_schema() -> str:
+    return json.dumps(
+        {tag: "number from 0.0 to 1.0" for tag in score_metric_tags()},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def score_metrics_json_config() -> str:
+    return json.dumps(configured_score_metrics(), indent=2, ensure_ascii=False)
+
+
+def render_scoring_prompt_template(template: str) -> str:
+    replacements = {
+        "{{score_metrics_instructions}}": score_metrics_prompt_instructions(),
+        "{{score_metrics_json_schema}}": score_metrics_json_schema(),
+        "{{score_metrics_json_config}}": score_metrics_json_config(),
+        "{{score_metric_tags_json}}": json.dumps(score_metric_tags(), ensure_ascii=False),
+    }
+
+    rendered = template
+
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+
+    return rendered
 
 
 @dataclass
 class ModerationScore:
-    embarrassment: float = 0.0
-    severity: float = 0.0
-    targetedness: float = 0.0
-    harassment: float = 0.0
-    threat: float = 0.0
-    certainty: float = 1.0
+    metrics: dict[str, float] = field(default_factory=dict)
     explanation: str = ""
     hard_override: bool = False
     hard_override_reason: str | None = None
 
-    def dimension_values(self) -> dict[str, float]:
+    def metric_values(self) -> dict[str, float]:
         return {
-            "embarrassment": self.embarrassment,
-            "severity": self.severity,
-            "targetedness": self.targetedness,
-            "harassment": self.harassment,
-            "threat": self.threat,
-            "certainty": self.certainty,
+            tag: clamp01(self.metrics.get(tag, 0.0))
+            for tag in score_metric_tags()
         }
+
+    def metric(self, tag: str, default: float = 0.0) -> float:
+        values = self.metric_values()
+        return values.get(str(tag), default)
 
     @property
     def total_score(self) -> float:
-        values = self.dimension_values().values()
-        return clamp01(sum(values) / len(DIMENSION_FIELDS))
+        metrics = configured_score_metrics()
+
+        if not metrics:
+            return 0.0
+
+        values = self.metric_values()
+        weighted_sum = 0.0
+
+        for metric in metrics:
+            tag = metric["tag"]
+            weight = float(metric.get("weight", 1.0))
+            weighted_sum += values.get(tag, 0.0) * weight
+
+        # Intentionally divide by the number of configured metrics, not the sum
+        # of weights. This makes weights act as force multipliers for important
+        # metrics while keeping the output clamped to the 0.0-1.0 action range.
+        return clamp01(weighted_sum / len(metrics))
 
     @property
     def score(self) -> float:
-        # The action score is always the model's six-dimensional average.
-        # Hard overrides can force actions, but they do not inflate the score.
         return self.total_score
+
+    def metric_summary(self) -> str:
+        return " ".join(
+            f"{tag}={value:.2f}"
+            for tag, value in self.metric_values().items()
+        )
 
     @property
     def reason(self) -> str:
@@ -97,15 +252,7 @@ class ModerationScore:
         if parts:
             return " ".join(parts)[:500]
 
-        return (
-            "Dimensional moderation scores: "
-            f"embarrassment={self.embarrassment:.2f}, "
-            f"severity={self.severity:.2f}, "
-            f"targetedness={self.targetedness:.2f}, "
-            f"harassment={self.harassment:.2f}, "
-            f"threat={self.threat:.2f}, "
-            f"certainty={self.certainty:.2f}."
-        )
+        return f"Configured moderation scores: {self.metric_summary()}."
 
 
 @dataclass
@@ -411,12 +558,7 @@ def apply_hard_moderation_overrides(
     reason = str(cfg.get("reason", "Message contains a configured banned term."))[:500]
 
     return ModerationScore(
-        embarrassment=score.embarrassment,
-        severity=score.severity,
-        targetedness=score.targetedness,
-        harassment=score.harassment,
-        threat=score.threat,
-        certainty=score.certainty,
+        metrics=score.metric_values(),
         explanation=score.explanation,
         hard_override=True,
         hard_override_reason=reason,
@@ -444,15 +586,12 @@ def threshold_matches(score_value: float, threshold: Any, default: float = 0.70)
 
 
 def moderation_score_value(score: ModerationScore, field: Any = "score") -> float:
-    field_name = str(field or "score").strip().lower()
+    field_name = str(field or "score").strip()
 
-    if field_name in {"score", "total_score"}:
+    if field_name.lower() in {"score", "total_score"}:
         return score.score
 
-    if field_name in DIMENSION_FIELDS:
-        return score.dimension_values()[field_name]
-
-    return score.score
+    return score.metric(field_name, score.score)
 
 
 def threshold_float(name: str, default: float) -> float:
@@ -467,32 +606,54 @@ def threshold_float(name: str, default: float) -> float:
         return default
 
 
+def thresholds_config() -> dict[str, Any]:
+    cfg = config.get("thresholds", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def configured_certainty_metric_tag() -> str:
+    return str(thresholds_config().get("certainty_metric_tag", "certainty")).strip()
+
+
 def score_needs_moderator_review(score: ModerationScore) -> bool:
     if score.hard_override:
         return True
 
+    thresholds_cfg = thresholds_config()
     review_score = threshold_float("moderator_review_score", 0.65)
-    any_dimension_score = threshold_float("moderator_review_any_dimension_score", 0.75)
+    any_metric_score = threshold_float("moderator_review_any_metric_score", 0.75)
     uncertain_certainty_threshold = threshold_float("uncertain_review_certainty_threshold", 0.35)
     uncertain_min_score = threshold_float("uncertain_review_min_score", 0.45)
 
     if score.score >= review_score:
         return True
 
-    if max(score.severity, score.targetedness, score.harassment, score.threat) >= any_dimension_score:
+    metric_values = score.metric_values()
+    review_tags = thresholds_cfg.get("moderator_review_metric_tags")
+
+    if isinstance(review_tags, list) and review_tags:
+        review_values = [
+            metric_values[tag]
+            for tag in (str(item) for item in review_tags)
+            if tag in metric_values
+        ]
+    else:
+        review_values = list(metric_values.values())
+
+    if review_values and max(review_values) >= any_metric_score:
         return True
 
-    if score.certainty <= uncertain_certainty_threshold and score.total_score >= uncertain_min_score:
-        return True
+    certainty_tag = configured_certainty_metric_tag()
+
+    if certainty_tag in metric_values:
+        if metric_values[certainty_tag] <= uncertain_certainty_threshold and score.total_score >= uncertain_min_score:
+            return True
 
     return False
 
 
 def score_should_reset(score: ModerationScore) -> bool:
-    thresholds_cfg = config.get("thresholds", {})
-
-    if not isinstance(thresholds_cfg, dict):
-        thresholds_cfg = {}
+    thresholds_cfg = thresholds_config()
 
     if score.hard_override:
         return bool(banned_terms_config().get("reset", True))
@@ -507,22 +668,24 @@ def score_should_reset(score: ModerationScore) -> bool:
     if moderation_score_value(score, trigger_field) < trigger_score:
         return False
 
+    metric_values = score.metric_values()
+    certainty_tag = configured_certainty_metric_tag()
     minimum_certainty = thresholds_cfg.get("minimum_certainty_for_reset")
 
-    if minimum_certainty is not None:
+    if minimum_certainty is not None and certainty_tag in metric_values:
         try:
-            if score.certainty < float(minimum_certainty):
+            if metric_values[certainty_tag] < float(minimum_certainty):
                 return False
         except Exception:
             pass
 
-    if bool(thresholds_cfg.get("require_all_dimensions", False)):
+    if bool(thresholds_cfg.get("require_all_metrics", False)):
         try:
-            all_dimensions_threshold = float(thresholds_cfg.get("all_dimensions_threshold", trigger_score))
+            all_metrics_threshold = float(thresholds_cfg.get("all_metrics_threshold", trigger_score))
         except Exception:
-            all_dimensions_threshold = trigger_score
+            all_metrics_threshold = trigger_score
 
-        if any(value < all_dimensions_threshold for value in score.dimension_values().values()):
+        if any(value < all_metrics_threshold for value in metric_values.values()):
             return False
 
     return True
@@ -745,12 +908,8 @@ def score_record_from_message(
         "scores": {
             "score": score.score,
             "total_score": score.total_score,
-            "embarrassment": score.embarrassment,
-            "severity": score.severity,
-            "targetedness": score.targetedness,
-            "harassment": score.harassment,
-            "threat": score.threat,
-            "certainty": score.certainty,
+            "metrics": score.metric_values(),
+            "weights": score_metric_weights(),
         },
         "moderator_review": score_needs_moderator_review(score),
         "reset_recommended": score_should_reset(score),
@@ -840,7 +999,15 @@ def score_record_value(record: dict[str, Any], name: str, default: float = 0.0) 
     if not isinstance(scores, dict):
         scores = {}
 
-    return clamp01(scores.get(name, default))
+    if name in {"score", "total_score"}:
+        return clamp01(scores.get(name, default))
+
+    metrics = scores.get("metrics", {})
+
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    return clamp01(metrics.get(name, default))
 
 
 def format_stored_score_record(record: dict[str, Any]) -> str:
@@ -878,19 +1045,23 @@ def format_stored_score_record(record: dict[str, Any]) -> str:
     if bool(cfg.get("show_total_score", True)):
         lines.append(f"Score: `{score_record_value(record, 'score'):.2f}`")
 
-    if bool(cfg.get("show_dimensions", True)):
-        lines.extend(
-            [
-                "",
-                "**Dimensions**",
-                f"embarrassment: `{score_record_value(record, 'embarrassment'):.2f}`",
-                f"severity: `{score_record_value(record, 'severity'):.2f}`",
-                f"targetedness: `{score_record_value(record, 'targetedness'):.2f}`",
-                f"harassment: `{score_record_value(record, 'harassment'):.2f}`",
-                f"threat: `{score_record_value(record, 'threat'):.2f}`",
-                f"certainty: `{score_record_value(record, 'certainty'):.2f}`",
-            ]
-        )
+    if bool(cfg.get("show_metrics", True)):
+        scores = record.get("scores", {})
+        metrics = scores.get("metrics", {}) if isinstance(scores, dict) else {}
+        weights = scores.get("weights", {}) if isinstance(scores, dict) else {}
+
+        if isinstance(metrics, dict) and metrics:
+            lines.extend(["", "**Score metrics**"])
+
+            for tag, value in metrics.items():
+                weight = weights.get(tag, 1.0) if isinstance(weights, dict) else 1.0
+
+                try:
+                    weight_value = float(weight)
+                except Exception:
+                    weight_value = 1.0
+
+                lines.append(f"{tag}: `{clamp01(value):.2f}` × weight `{weight_value:.2f}`")
 
     if bool(cfg.get("show_decision_flags", True)):
         lines.extend(
@@ -997,6 +1168,25 @@ def allowed_mentions_from_message_config(cfg: dict[str, Any]) -> discord.Allowed
 class SafeFormatDict(dict[str, str]):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+def score_template_values(score: ModerationScore) -> dict[str, str]:
+    values = {
+        "score": f"{score.score:.2f}",
+        "total_score": f"{score.total_score:.2f}",
+        "metrics": score.metric_summary(),
+        "reason": score.reason,
+        "moderator_review": str(score_needs_moderator_review(score)).lower(),
+        "reset_recommended": str(score_should_reset(score)).lower(),
+    }
+
+    weights = score_metric_weights()
+
+    for tag, value in score.metric_values().items():
+        values[tag] = f"{value:.2f}"
+        values[f"{tag}_weight"] = f"{weights.get(tag, 1.0):.2f}"
+
+    return values
 
 
 def presence_config() -> dict[str, Any]:
@@ -1264,17 +1454,7 @@ def render_new_channel_message_template(
         attempt_name=attempt_name(attempt_number),
         previous_attempt=str(previous_attempt_number),
         previous_attempt_name=attempt_name(previous_attempt_number),
-        score=f"{score.score:.2f}",
-        total_score=f"{score.total_score:.2f}",
-        embarrassment=f"{score.embarrassment:.2f}",
-        severity=f"{score.severity:.2f}",
-        targetedness=f"{score.targetedness:.2f}",
-        harassment=f"{score.harassment:.2f}",
-        threat=f"{score.threat:.2f}",
-        certainty=f"{score.certainty:.2f}",
-        reason=score.reason,
-        moderator_review=str(score_needs_moderator_review(score)).lower(),
-        reset_recommended=str(score_should_reset(score)).lower(),
+        **score_template_values(score),
         channel_mention=new_channel.mention,
         channel_name=new_channel.name,
         manual=str(manual).lower(),
@@ -1311,17 +1491,7 @@ def render_warning_reply_template(
         attempt_name=attempt_name(attempt_number),
         previous_attempt=str(attempt_number),
         previous_attempt_name=attempt_name(attempt_number),
-        score=f"{score.score:.2f}",
-        total_score=f"{score.total_score:.2f}",
-        embarrassment=f"{score.embarrassment:.2f}",
-        severity=f"{score.severity:.2f}",
-        targetedness=f"{score.targetedness:.2f}",
-        harassment=f"{score.harassment:.2f}",
-        threat=f"{score.threat:.2f}",
-        certainty=f"{score.certainty:.2f}",
-        reason=score.reason,
-        moderator_review=str(score_needs_moderator_review(score)).lower(),
-        reset_recommended=str(score_should_reset(score)).lower(),
+        **score_template_values(score),
         channel_mention=getattr(channel, "mention", ""),
         channel_name=getattr(channel, "name", str(channel)),
         message_id=str(message.id),
@@ -1531,6 +1701,16 @@ def parse_dimension(data: dict[str, Any], name: str, default: float = 0.0) -> fl
     return clamp01(data.get(name, default))
 
 
+def score_metrics_with_value(value: float, *, certainty: float | None = None) -> dict[str, float]:
+    metrics = {tag: clamp01(value) for tag in score_metric_tags()}
+    certainty_tag = configured_certainty_metric_tag()
+
+    if certainty is not None and certainty_tag in metrics:
+        metrics[certainty_tag] = clamp01(certainty)
+
+    return metrics
+
+
 def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
     raw = payload.get("response", "{}")
 
@@ -1538,17 +1718,21 @@ def parse_ollama_response(payload: dict[str, Any]) -> ModerationScore:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return ModerationScore(
-            certainty=0.0,
+            metrics=score_metrics_with_value(0.0, certainty=0.0),
             explanation="The moderation model did not return valid JSON.",
         )
 
+    if not isinstance(data, dict):
+        return ModerationScore(
+            metrics=score_metrics_with_value(0.0, certainty=0.0),
+            explanation="The moderation model did not return a JSON object.",
+        )
+
     return ModerationScore(
-        embarrassment=parse_dimension(data, "embarrassment", 0.0),
-        severity=parse_dimension(data, "severity", 0.0),
-        targetedness=parse_dimension(data, "targetedness", 0.0),
-        harassment=parse_dimension(data, "harassment", 0.0),
-        threat=parse_dimension(data, "threat", 0.0),
-        certainty=parse_dimension(data, "certainty", 0.0),
+        metrics={
+            tag: parse_dimension(data, tag, 0.0)
+            for tag in score_metric_tags()
+        }
     )
 
 
@@ -1625,12 +1809,8 @@ def make_training_record(
         "silent": silent,
         "score": score.score,
         "reason": score.explanation or score.hard_override_reason,
-        "embarrassment": score.embarrassment,
-        "severity": score.severity,
-        "targetedness": score.targetedness,
-        "harassment": score.harassment,
-        "threat": score.threat,
-        "certainty": score.certainty,
+        "metrics": score.metric_values(),
+        "metric_weights": score_metric_weights(),
         "hard_override": score.hard_override,
         "moderator_review": score_needs_moderator_review(score),
         "reset_recommended": score_should_reset(score),
@@ -1736,7 +1916,9 @@ async def generate_reason_with_ollama(
     reason_payload = {
         "message_to_classify": message_text,
         "attachments": attachment_summary,
-        "scores": score.dimension_values(),
+        "score_metric_tags": score_metric_tags(),
+        "scores": score.metric_values(),
+        "score_metrics": configured_score_metrics(),
         "total_score": score.total_score,
     }
 
@@ -1795,7 +1977,7 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
 
     if not message_text and not message.attachments:
         return ModerationScore(
-            certainty=1.0,
+            metrics=score_metrics_with_value(0.0, certainty=1.0),
             explanation="No text content or attachments to evaluate.",
         )
 
@@ -1810,7 +1992,7 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
             }
         )
 
-    scoring_prompt = configured_ollama_scoring_prompt()
+    scoring_prompt = render_scoring_prompt_template(configured_ollama_scoring_prompt())
 
     user_prompt = {
         "classification_task": (
@@ -1822,6 +2004,7 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
         "channel_id": str(message.channel.id),
         "message_to_classify": message_text,
         "attachments": attachment_summary,
+        "score_metric_tags": score_metric_tags(),
     }
 
     request_payload = {
@@ -2136,15 +2319,8 @@ async def send_incident_review(
     embed.add_field(name="Score", value=f"{score.score:.2f}", inline=True)
     embed.add_field(name="Total", value=f"{score.total_score:.2f}", inline=True)
     embed.add_field(
-        name="Dimensions",
-        value=(
-            f"embarrassment={score.embarrassment:.2f}, "
-            f"severity={score.severity:.2f}, "
-            f"targetedness={score.targetedness:.2f}, "
-            f"harassment={score.harassment:.2f}, "
-            f"threat={score.threat:.2f}, "
-            f"certainty={score.certainty:.2f}"
-        ),
+        name="Metrics",
+        value=score.metric_summary()[:1024],
         inline=False,
     )
     embed.add_field(name="User", value=f"{message.author} / `{message.author.id}`", inline=False)
@@ -2565,9 +2741,7 @@ async def on_message(message: discord.Message) -> None:
     print(
         f"message={message.id} user={message.author.id} "
         f"score={score.score:.2f} total={score.total_score:.2f} "
-        f"embarrassment={score.embarrassment:.2f} severity={score.severity:.2f} "
-        f"targetedness={score.targetedness:.2f} harassment={score.harassment:.2f} "
-        f"threat={score.threat:.2f} certainty={score.certainty:.2f}"
+        f"metrics={score.metric_summary()}"
     )
 
     if not score_should_reset(score):
@@ -2661,17 +2835,12 @@ async def nuke(
 
     if silent:
         score = ModerationScore(
-            certainty=1.0,
+            metrics=score_metrics_with_value(0.0, certainty=1.0),
             explanation="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
         )
     else:
         score = ModerationScore(
-            embarrassment=1.0,
-            severity=1.0,
-            targetedness=1.0,
-            harassment=1.0,
-            threat=1.0,
-            certainty=1.0,
+            metrics=score_metrics_with_value(1.0, certainty=1.0),
             explanation="A moderator manually marked this message as severe enough to reset the attempt.",
         )
 
@@ -2723,12 +2892,7 @@ async def nuke_context_menu(
         return
 
     score = ModerationScore(
-        embarrassment=1.0,
-        severity=1.0,
-        targetedness=1.0,
-        harassment=1.0,
-        threat=1.0,
-        certainty=1.0,
+        metrics=score_metrics_with_value(1.0, certainty=1.0),
         explanation="A moderator manually marked this message as severe enough to reset the attempt.",
     )
 
@@ -2774,7 +2938,7 @@ async def silent_nuke_context_menu(
         return
 
     score = ModerationScore(
-        certainty=1.0,
+        metrics=score_metrics_with_value(0.0, certainty=1.0),
         explanation="A moderator manually archived/replaced the channel without incrementing attempts or strikes.",
     )
 

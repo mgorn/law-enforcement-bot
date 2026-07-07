@@ -35,10 +35,17 @@
     "trigger_score": 0.91,
     "trigger_score_field": "score",
     "moderator_review_score": 0.65,
-    "moderator_review_any_dimension_score": 0.75,
+    "moderator_review_any_metric_score": 0.75,
+    "moderator_review_metric_tags": [
+      "severity",
+      "targetedness",
+      "harassment",
+      "threat"
+    ],
+    "certainty_metric_tag": "certainty",
     "minimum_certainty_for_reset": 0.5,
-    "require_all_dimensions": false,
-    "all_dimensions_threshold": 0.91,
+    "require_all_metrics": false,
+    "all_metrics_threshold": 0.91,
     "uncertain_review_certainty_threshold": 0.35,
     "uncertain_review_min_score": 0.45
   },
@@ -158,12 +165,12 @@
     "show_channel": true,
     "show_timestamps": true,
     "show_total_score": true,
-    "show_dimensions": true,
     "show_decision_flags": true,
     "show_reason": true,
     "show_message_content": true,
     "max_message_content_length": 800,
-    "use_mentions": true
+    "use_mentions": true,
+    "show_metrics": true
   },
   "reason_generation": {
     "enabled": true,
@@ -185,5 +192,37 @@
     "sample_non_triggered": true,
     "non_triggered_sample_rate": 0.02,
     "minimum_score_to_log_non_triggered": 0.55
-  }
+  },
+  "score_metrics": [
+    {
+      "tag": "embarrassment",
+      "description": "0.0 to 1.0 for how clownable or embarrassing the message is for the sender. This is social/funny cringe, not harm.",
+      "weight": 1.0
+    },
+    {
+      "tag": "severity",
+      "description": "0.0 to 1.0 for how harmful, policy-bad, cruel, hateful, dangerous, or inappropriate the language/content is.",
+      "weight": 2.0
+    },
+    {
+      "tag": "targetedness",
+      "description": "0.0 to 1.0 for whether the message is aimed at a real person, Discord user, real group, or protected group. General venting is lower; direct @user or group-directed abuse is higher.",
+      "weight": 1.0
+    },
+    {
+      "tag": "harassment",
+      "description": "0.0 to 1.0 for abuse, bullying, humiliation, personal attacks, repeated hostility, or targeted cruelty.",
+      "weight": 1.5
+    },
+    {
+      "tag": "threat",
+      "description": "0.0 to 1.0 for threats of violence or intent to harm. Fictional-character threats score lower than threats toward real people.",
+      "weight": 1.5
+    },
+    {
+      "tag": "certainty",
+      "description": "0.0 to 1.0 for context certainty / context completeness. 0.0 means important context is missing before taking action; 1.0 means the message itself provides enough context to judge.",
+      "weight": 1.0
+    }
+  ]
 }
