@@ -630,6 +630,34 @@ def score_command_ephemeral() -> bool:
     return bool(score_command_config().get("ephemeral", True))
 
 
+def reason_generation_config() -> dict[str, Any]:
+    cfg = config.get("reason_generation", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def reason_generation_enabled() -> bool:
+    return bool(reason_generation_config().get("enabled", True))
+
+
+def should_generate_reason_for_warning_replies() -> bool:
+    cfg = reason_generation_config()
+    return reason_generation_enabled() and bool(cfg.get("generate_for_warning_replies", True))
+
+
+def should_generate_reason_for_resets() -> bool:
+    cfg = reason_generation_config()
+    return reason_generation_enabled() and bool(cfg.get("generate_for_resets", True))
+
+
+def should_store_generated_reason() -> bool:
+    cfg = reason_generation_config()
+    return bool(cfg.get("store_when_generated", True))
+
+
+def template_references_reason(template: str) -> bool:
+    return "{reason" in template
+
+
 def score_command_required_permission() -> str:
     return str(score_command_config().get("moderator_permission", "manage_messages"))
 
@@ -724,8 +752,8 @@ def score_record_from_message(
         "reset_recommended": score_should_reset(score),
     }
 
-    if bool(records_cfg.get("store_reason", True)):
-        record["reason"] = score.reason
+    if bool(records_cfg.get("store_reason", True)) and score.explanation:
+        record["reason"] = score.explanation
 
     if bool(records_cfg.get("store_message_content", True)):
         record["model_message_content"] = truncate_text(model_message_content, max_content_length)
@@ -768,6 +796,33 @@ async def stored_score_record(message_id: int) -> dict[str, Any] | None:
 
     record = records.get("scores", {}).get(str(message_id))
     return record if isinstance(record, dict) else None
+
+
+async def update_stored_score_reason(message_id: int, reason: str) -> None:
+    if not score_records_enabled():
+        return
+
+    if not should_store_generated_reason():
+        return
+
+    if not bool(score_records_config().get("store_reason", True)):
+        return
+
+    reason = reason.strip()
+
+    if not reason:
+        return
+
+    async with score_records_lock:
+        records = load_score_records()
+        record = records.get("scores", {}).get(str(message_id))
+
+        if not isinstance(record, dict):
+            return
+
+        record["reason"] = reason[:500]
+        record["reason_generated_at"] = utc_now_iso()
+        save_score_records(records)
 
 
 def score_record_message_id_from_reference(message_ref: str) -> int:
@@ -1135,7 +1190,11 @@ async def maybe_send_warning_reply(message: discord.Message, score: ModerationSc
     if not templates:
         return
 
-    template = random.choice(templates)
+    template = str(random.choice(templates))
+
+    if template_references_reason(template) and should_generate_reason_for_warning_replies():
+        await ensure_score_reason(message, score)
+
     content = render_warning_reply_template(template, message=message, score=score)
 
     try:
@@ -1316,7 +1375,7 @@ def make_training_record(
         "manual": manual,
         "silent": silent,
         "score": score.score,
-        "reason": score.reason,
+        "reason": score.explanation or score.hard_override_reason,
         "embarrassment": score.embarrassment,
         "severity": score.severity,
         "targetedness": score.targetedness,
@@ -1366,10 +1425,6 @@ async def generate_reason_with_ollama(
     score: ModerationScore,
 ) -> str:
     ollama_cfg = config["ollama"]
-
-    if not bool(ollama_cfg.get("generate_reason", True)):
-        return ""
-
     reason_prompt = configured_ollama_reason_prompt()
     reason_payload = {
         "message_to_classify": message_text,
@@ -1392,6 +1447,39 @@ async def generate_reason_with_ollama(
         return ""
 
     return str(payload.get("response", "")).strip()[:500]
+
+
+async def ensure_score_reason(message: discord.Message, score: ModerationScore) -> str:
+    if score.explanation:
+        return score.explanation
+
+    if not reason_generation_enabled():
+        return ""
+
+    message_text = clean_for_prompt(message.content or "")
+    attachment_summary = []
+
+    for attachment in message.attachments:
+        attachment_summary.append(
+            {
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "url": attachment.url,
+            }
+        )
+
+    reason = await generate_reason_with_ollama(
+        message_text=message_text,
+        attachment_summary=attachment_summary,
+        score=score,
+    )
+
+    if not reason:
+        return ""
+
+    score.explanation = reason
+    await update_stored_score_reason(message.id, reason)
+    return reason
 
 
 async def score_message_with_ollama(message: discord.Message) -> ModerationScore:
@@ -1439,15 +1527,6 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
 
     payload = await post_ollama_generate(request_payload)
     score = parse_ollama_response(payload)
-
-    reason = await generate_reason_with_ollama(
-        message_text=message_text,
-        attachment_summary=attachment_summary,
-        score=score,
-    )
-
-    if reason:
-        score.explanation = reason
 
     await store_message_score_record(
         message=message,
@@ -1924,6 +2003,9 @@ async def reset_attempt_from_message(
             await move_to_private_archive(old_channel, old_attempt, reason)
         except discord.Forbidden as error:
             raise RuntimeError(format_forbidden("Moving/privatizing the old attempt channel", error)) from error
+
+        if should_generate_reason_for_resets():
+            await ensure_score_reason(message, score)
 
         if not silent:
             strikes = increment_user_strikes(member.id)

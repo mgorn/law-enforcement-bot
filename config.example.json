@@ -13,8 +13,7 @@
     "model": "llama3.1:8b",
     "timeout_seconds": 30,
     "prompt_path": "prompt.txt",
-    "reason_prompt_path": "reason_prompt.txt",
-    "generate_reason": true
+    "reason_prompt_path": "reason_prompt.txt"
   },
   "thresholds": {
     "trigger_score": 0.91,
@@ -149,6 +148,12 @@
     "show_message_content": true,
     "max_message_content_length": 800,
     "use_mentions": true
+  },
+  "reason_generation": {
+    "enabled": true,
+    "generate_for_warning_replies": true,
+    "generate_for_resets": true,
+    "store_when_generated": true
   },
   "ban": {
     "enabled": false,
