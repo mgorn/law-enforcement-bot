@@ -158,6 +158,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 incident_lock = asyncio.Lock()
+score_records_lock = asyncio.Lock()
 
 
 def snowflake(value: Any) -> int:
@@ -597,6 +598,327 @@ def clamp_strikes_limit(limit: int | None) -> int:
         requested = limit
 
     return max(1, min(int(requested), max_limit))
+
+
+def score_records_config() -> dict[str, Any]:
+    cfg = config.get("score_records", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def score_records_enabled() -> bool:
+    return bool(score_records_config().get("enabled", True))
+
+
+def score_records_path() -> Path:
+    return Path(str(score_records_config().get("path", "data/message_scores.json")))
+
+
+def score_records_pretty_json() -> bool:
+    return bool(score_records_config().get("pretty_json", True))
+
+
+def score_command_config() -> dict[str, Any]:
+    cfg = config.get("score_command", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def score_command_enabled() -> bool:
+    return bool(score_command_config().get("enabled", True))
+
+
+def score_command_ephemeral() -> bool:
+    return bool(score_command_config().get("ephemeral", True))
+
+
+def score_command_required_permission() -> str:
+    return str(score_command_config().get("moderator_permission", "manage_messages"))
+
+
+def score_command_member_allowed(member: discord.Member) -> bool:
+    cfg = score_command_config()
+
+    if not bool(cfg.get("moderator_only", False)):
+        return True
+
+    permissions = member.guild_permissions
+
+    if permissions.administrator:
+        return True
+
+    permission_name = score_command_required_permission()
+    return bool(getattr(permissions, permission_name, False))
+
+
+def truncate_text(text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+
+    if len(text) <= max_len:
+        return text
+
+    if max_len <= 3:
+        return text[:max_len]
+
+    return text[: max_len - 3] + "..."
+
+
+def load_score_records() -> dict[str, Any]:
+    path = score_records_path()
+    data = load_json(path, {"schema_version": 1, "scores": {}})
+
+    if not isinstance(data, dict):
+        return {"schema_version": 1, "scores": {}}
+
+    if not isinstance(data.get("scores"), dict):
+        data["scores"] = {}
+
+    data.setdefault("schema_version", 1)
+    return data
+
+
+def save_score_records(data: dict[str, Any]) -> None:
+    path = score_records_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    with tmp_path.open("w", encoding="utf-8") as file:
+        if score_records_pretty_json():
+            json.dump(data, file, indent=2, sort_keys=True, ensure_ascii=False)
+        else:
+            json.dump(data, file, separators=(",", ":"), ensure_ascii=False)
+
+    tmp_path.replace(path)
+
+
+def score_record_from_message(
+    *,
+    message: discord.Message,
+    score: ModerationScore,
+    model_message_content: str,
+    model_input: dict[str, Any],
+) -> dict[str, Any]:
+    records_cfg = score_records_config()
+    max_content_length = int(records_cfg.get("max_message_content_length", 2000))
+
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "scored_at": utc_now_iso(),
+        "guild_id": str(message.guild.id) if message.guild is not None else None,
+        "channel_id": str(message.channel.id),
+        "message_id": str(message.id),
+        "message_jump_url": message.jump_url,
+        "message_created_at": message.created_at.isoformat(),
+        "author_id": str(message.author.id),
+        "author_name": str(message.author),
+        "scores": {
+            "score": score.score,
+            "total_score": score.total_score,
+            "embarrassment": score.embarrassment,
+            "severity": score.severity,
+            "targetedness": score.targetedness,
+            "harassment": score.harassment,
+            "threat": score.threat,
+            "certainty": score.certainty,
+        },
+        "moderator_review": score_needs_moderator_review(score),
+        "reset_recommended": score_should_reset(score),
+    }
+
+    if bool(records_cfg.get("store_reason", True)):
+        record["reason"] = score.reason
+
+    if bool(records_cfg.get("store_message_content", True)):
+        record["model_message_content"] = truncate_text(model_message_content, max_content_length)
+
+    if bool(records_cfg.get("store_model_input", False)):
+        record["model_input"] = model_input
+
+    return record
+
+
+async def store_message_score_record(
+    *,
+    message: discord.Message,
+    score: ModerationScore,
+    model_message_content: str,
+    model_input: dict[str, Any],
+) -> None:
+    if not score_records_enabled():
+        return
+
+    record = score_record_from_message(
+        message=message,
+        score=score,
+        model_message_content=model_message_content,
+        model_input=model_input,
+    )
+
+    async with score_records_lock:
+        records = load_score_records()
+        records.setdefault("scores", {})[str(message.id)] = record
+        save_score_records(records)
+
+
+async def stored_score_record(message_id: int) -> dict[str, Any] | None:
+    if not score_records_enabled():
+        return None
+
+    async with score_records_lock:
+        records = load_score_records()
+
+    record = records.get("scores", {}).get(str(message_id))
+    return record if isinstance(record, dict) else None
+
+
+def score_record_message_id_from_reference(message_ref: str) -> int:
+    _channel_id, message_id = parse_message_reference(message_ref)
+    return message_id
+
+
+def score_record_value(record: dict[str, Any], name: str, default: float = 0.0) -> float:
+    scores = record.get("scores", {})
+
+    if not isinstance(scores, dict):
+        scores = {}
+
+    return clamp01(scores.get(name, default))
+
+
+def format_stored_score_record(record: dict[str, Any]) -> str:
+    cfg = score_command_config()
+    title = str(cfg.get("title", "Stored moderation score"))
+    content_max_len = int(cfg.get("max_message_content_length", 800))
+
+    message_id = str(record.get("message_id", "unknown"))
+    jump_url = str(record.get("message_jump_url", ""))
+    author_id = record.get("author_id")
+    channel_id = record.get("channel_id")
+
+    lines = [f"**{title}**"]
+
+    if bool(cfg.get("show_message_link", True)) and jump_url:
+        lines.append(f"Message: {jump_url}")
+    else:
+        lines.append(f"Message ID: `{message_id}`")
+
+    if bool(cfg.get("show_author", True)) and author_id:
+        if bool(cfg.get("use_mentions", True)):
+            lines.append(f"Author: <@{author_id}>")
+        else:
+            lines.append(f"Author ID: `{author_id}`")
+
+    if bool(cfg.get("show_channel", True)) and channel_id:
+        lines.append(f"Channel: <#{channel_id}>")
+
+    if bool(cfg.get("show_timestamps", True)):
+        if record.get("scored_at"):
+            lines.append(f"Scored at: `{record['scored_at']}`")
+        if record.get("message_created_at"):
+            lines.append(f"Message created at: `{record['message_created_at']}`")
+
+    if bool(cfg.get("show_total_score", True)):
+        lines.append(f"Score: `{score_record_value(record, 'score'):.2f}`")
+
+    if bool(cfg.get("show_dimensions", True)):
+        lines.extend(
+            [
+                "",
+                "**Dimensions**",
+                f"embarrassment: `{score_record_value(record, 'embarrassment'):.2f}`",
+                f"severity: `{score_record_value(record, 'severity'):.2f}`",
+                f"targetedness: `{score_record_value(record, 'targetedness'):.2f}`",
+                f"harassment: `{score_record_value(record, 'harassment'):.2f}`",
+                f"threat: `{score_record_value(record, 'threat'):.2f}`",
+                f"certainty: `{score_record_value(record, 'certainty'):.2f}`",
+            ]
+        )
+
+    if bool(cfg.get("show_decision_flags", True)):
+        lines.extend(
+            [
+                "",
+                f"Moderator review: `{str(bool(record.get('moderator_review', False))).lower()}`",
+                f"Reset recommended: `{str(bool(record.get('reset_recommended', False))).lower()}`",
+            ]
+        )
+
+    if bool(cfg.get("show_reason", True)) and record.get("reason"):
+        lines.extend(["", f"Reason: {record['reason']}"])
+
+    if bool(cfg.get("show_message_content", True)) and record.get("model_message_content") is not None:
+        message_content = truncate_text(str(record.get("model_message_content", "")), content_max_len)
+        lines.extend(["", "**Message content given to the model**", f">>> {message_content}"])
+
+    text = "\n".join(lines)
+
+    if len(text) > 1950:
+        text = text[:1947] + "..."
+
+    return text
+
+
+async def respond_with_stored_score(
+    interaction: discord.Interaction,
+    *,
+    message_id: int,
+) -> None:
+    cfg = score_command_config()
+    response_ephemeral = bool(cfg.get("ephemeral", True))
+
+    if not score_command_enabled():
+        await interaction.followup.send(
+            "The score command is disabled in the bot config.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send(
+            "Could not resolve your server member object.",
+            ephemeral=True,
+        )
+        return
+
+    if not score_command_member_allowed(interaction.user):
+        await interaction.followup.send(
+            "You do not have permission to view stored moderation scores.",
+            ephemeral=True,
+        )
+        return
+
+    if not score_records_enabled():
+        await interaction.followup.send(
+            str(cfg.get("storage_disabled_message", "Score storage is disabled in the bot config.")),
+            ephemeral=True,
+        )
+        return
+
+    record = await stored_score_record(message_id)
+
+    if record is None:
+        await interaction.followup.send(
+            str(
+                cfg.get(
+                    "not_found_message",
+                    "No stored score was found for that message. The bot only shows messages it has already scanned.",
+                )
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        format_stored_score_record(record),
+        ephemeral=response_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 def allowed_mentions_from_message_config(cfg: dict[str, Any]) -> discord.AllowedMentions:
@@ -1126,6 +1448,13 @@ async def score_message_with_ollama(message: discord.Message) -> ModerationScore
 
     if reason:
         score.explanation = reason
+
+    await store_message_score_record(
+        message=message,
+        score=score,
+        model_message_content=message_text,
+        model_input=user_prompt,
+    )
 
     return score
 
@@ -1847,6 +2176,32 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
+@bot.tree.command(name="score", description="Show the stored moderation score for a message.")
+@app_commands.describe(message="Message ID or Discord message link to look up.")
+async def score_command(
+    interaction: discord.Interaction,
+    message: str,
+) -> None:
+    await interaction.response.defer(ephemeral=score_command_ephemeral())
+
+    try:
+        message_id = score_record_message_id_from_reference(message)
+    except Exception as error:
+        await interaction.followup.send(f"Invalid message reference: `{error}`", ephemeral=True)
+        return
+
+    await respond_with_stored_score(interaction, message_id=message_id)
+
+
+@app_commands.context_menu(name="Show Score")
+async def score_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    await interaction.response.defer(ephemeral=score_command_ephemeral())
+    await respond_with_stored_score(interaction, message_id=message.id)
+
+
 @bot.tree.command(
     name="nuke",
     description="Archive the current attempt channel and create a replacement.",
@@ -2035,6 +2390,7 @@ async def silent_nuke_context_menu(
 
 bot.tree.add_command(nuke_context_menu)
 bot.tree.add_command(silent_nuke_context_menu)
+bot.tree.add_command(score_context_menu)
 
 
 @bot.tree.command(name="attempt-state", description="Show the current attempt bot state.")

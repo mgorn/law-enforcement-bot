@@ -121,6 +121,35 @@
     "attempt_number": 1,
     "clear_leaderboard": true
   },
+  "score_records": {
+    "enabled": true,
+    "path": "data/message_scores.json",
+    "store_message_content": true,
+    "store_model_input": false,
+    "store_reason": true,
+    "max_message_content_length": 2000,
+    "pretty_json": true
+  },
+  "score_command": {
+    "enabled": true,
+    "moderator_only": false,
+    "moderator_permission": "manage_messages",
+    "ephemeral": true,
+    "title": "Stored moderation score",
+    "not_found_message": "No stored score was found for that message. The bot only shows messages it has already scanned.",
+    "storage_disabled_message": "Score storage is disabled in the bot config.",
+    "show_message_link": true,
+    "show_author": true,
+    "show_channel": true,
+    "show_timestamps": true,
+    "show_total_score": true,
+    "show_dimensions": true,
+    "show_decision_flags": true,
+    "show_reason": true,
+    "show_message_content": true,
+    "max_message_content_length": 800,
+    "use_mentions": true
+  },
   "ban": {
     "enabled": false,
     "strikes_required": 3,
